@@ -164,6 +164,7 @@ async function runDeletionChecks() {
   fragmentButton(second.id).click();
   await until(() => !fragmentButton(second.id), "second consecutive deletion stayed visible");
   assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 30010, "nearest tombstone expiry was not scheduled");
+  assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "toast did not target the newest deletion");
   frameDoc().querySelector("#recentlyDeleted").click();
   assert(undoButton(first.id) && undoButton(second.id), "not every recent deletion was accessible");
   undoButton(first.id).click();
@@ -173,19 +174,34 @@ async function runDeletionChecks() {
 
   frameWin().__ledgerTest.setNow(baseNow + 100);
   fragmentButton(first.id).click();
-  await until(() => !fragmentButton(first.id), "fragment stayed visible before expiry test");
+  await until(() => !fragmentButton(first.id), "first fragment stayed visible before expiry failure test");
+  frameWin().__ledgerTest.setNow(baseNow + 1000);
+  fragmentButton(second.id).click();
+  await until(() => !fragmentButton(second.id), "second fragment stayed visible before expiry failure test");
   assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 30100, "expiry timer used the wrong deadline");
-  frameWin().__ledgerTest.setNow(baseNow + 30101);
+  frameDoc().querySelector("#recentlyDeleted").click();
+  assert(undoButton(first.id) && undoButton(second.id), "expiry failure setup did not expose both tombstones");
+  frameWin().__ledgerTest.failNextExpiryPurge();
+  frameWin().__ledgerTest.setNow(baseNow + 30100);
+  await frameWin().__ledgerTest.fireExpiryTimer();
+  const failedPurge = await frameWin().__ledgerTest.readAll();
+  assert(failedPurge.fragments.some((fragment) => fragment.id === first.id), "forced purge failure did not preserve the tombstone");
+  assert(!undoButton(first.id) && undoButton(second.id), "purge failure did not remove expired Undo controls");
+  assert(!frameDoc().querySelector("#undoToast").hidden, "purge failure did not refresh the surviving Undo toast");
+  assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "purge failure left the expired tombstone in the toast");
+  assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 31000, "purge failure did not schedule the next future expiry");
+
+  frameWin().__ledgerTest.setNow(baseNow + 31000);
   await frameWin().__ledgerTest.fireExpiryTimer();
   await until(async () => {
-    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
-    return !stored;
-  }, "nearest-expiry cleanup did not purge the tombstone in-session");
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments;
+    return !stored.some((fragment) => fragment.id === first.id || fragment.id === second.id);
+  }, "future expiry did not retry cleanup in-session");
   assert(frameDoc().querySelector("#undoToast").hidden, "expired Undo toast remained visible");
   assert(frameDoc().querySelector("#recentlyDeleted").hidden, "expired recently deleted control remained visible");
   await reloadFrame();
-  const expired = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
-  assert(!expired, "expired tombstone survived reload cleanup");
+  const expired = (await frameWin().__ledgerTest.readAll()).fragments;
+  assert(!expired.some((fragment) => fragment.id === first.id || fragment.id === second.id), "expired tombstone survived reload cleanup");
 }
 
 async function run() {

@@ -389,6 +389,7 @@ let draftTimer = null;
 let expiryTimer = null;
 let expiryCallback = null;
 let expiryDueAt = null;
+let shouldFailNextExpiryPurge = false;
 let draftFailureAnnounced = false;
 let inputRevision = 0;
 let captureQueue = Promise.resolve();
@@ -431,6 +432,10 @@ function renderDeletedDialog(tombstones) {
 async function expireDeleted() {
   if (!database) return;
   try {
+    if (shouldFailNextExpiryPurge) {
+      shouldFailNextExpiryPurge = false;
+      throw new Error("test-expiry-purge-failure");
+    }
     const expiredIds = await purgeExpired(database, currentTime());
     if (expiredIds.length) {
       const expired = new Set(expiredIds);
@@ -438,6 +443,7 @@ async function expireDeleted() {
     }
     render();
   } catch {
+    render();
     announce("Expired deletions could not be cleared.");
   }
 }
@@ -582,6 +588,9 @@ if (isTestMode(location)) {
       if (!expiryCallback) throw new Error("no expiry timer scheduled");
       if (expiryTimer !== null) clearTimeout(expiryTimer);
       return expiryCallback();
+    },
+    failNextExpiryPurge() {
+      shouldFailNextExpiryPurge = true;
     },
     closeDatabase() {
       if (expiryTimer !== null) clearTimeout(expiryTimer);
