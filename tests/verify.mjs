@@ -71,6 +71,33 @@ test("only unexpired tombstones remain undoable", () => {
   assert.deepEqual(unexpiredTombstones(rows, 100).map(row => row.id), ["new"]);
 });
 
+test("search requires every token and excludes tombstones", () => {
+  const { searchFragments } = extractTestableLogic(readApp(), ["searchFragments"]);
+  const rows = [
+    { id: "1", createdAt: 3, text: "Blue quiet sky" },
+    { id: "2", createdAt: 2, text: "Blue sea", source: "notes.txt" },
+    { id: "3", createdAt: 1, text: "Blue quiet", deletedAt: 4, undoUntil: 100 },
+  ];
+  assert.deepEqual(searchFragments(rows, "BLUE quiet", 50).map(row => row.id), ["1"]);
+  assert.deepEqual(searchFragments(rows, "notes", 50).map(row => row.id), ["2"]);
+});
+
+test("search sorts matching live records and slices requested batches", () => {
+  const { queryTokens, matchesFragment, searchFragments, visibleSlice } = extractTestableLogic(readApp(), [
+    "queryTokens", "matchesFragment", "searchFragments", "visibleSlice",
+  ]);
+  const rows = [
+    { id: "z", createdAt: 7, text: "Needle", source: "Notebook" },
+    { id: "a", createdAt: 7, text: "needle note" },
+    { id: "old", createdAt: 6, text: "needle notebook" },
+    { id: "gone", createdAt: 9, text: "needle notebook", deletedAt: undefined },
+  ];
+  assert.deepEqual(queryTokens("  NEEDLE\tNotebook "), ["needle", "notebook"]);
+  assert.equal(matchesFragment(rows[0], ["needle", "notebook"]), true);
+  assert.deepEqual(searchFragments(rows, "needle", 100).map(row => row.id), ["a", "z", "old"]);
+  assert.deepEqual(visibleSlice(rows, 2).map(row => row.id), ["z", "a"]);
+});
+
 test("fragment IDs prefer UUIDs and fall back to timestamp plus random entropy", () => {
   const { makeId } = extractTestableLogic(readApp(), ["makeId"]);
   assert.equal(makeId(42, () => "uuid-preferred", () => 0.5), "uuid-preferred");

@@ -20,27 +20,6 @@ function deleteDatabase(name) {
   });
 }
 
-async function seedFragments(count) {
-  const db = await new Promise((resolve, reject) => {
-    const request = indexedDB.open("ledger-web");
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-  const tx = db.transaction("fragments", "readwrite");
-  for (let index = 0; index < count; index += 1) {
-    tx.objectStore("fragments").put({
-      id: "batch-" + index,
-      createdAt: index + 1,
-      text: "batch fragment " + index,
-    });
-  }
-  await new Promise((resolve, reject) => {
-    tx.oncomplete = resolve;
-    tx.onabort = tx.onerror = () => reject(tx.error || new Error("seed transaction failed"));
-  });
-  db.close();
-}
-
 async function holdFragmentWrites() {
   const db = await new Promise((resolve, reject) => {
     const request = indexedDB.open("ledger-web");
@@ -276,9 +255,46 @@ async function run() {
   assert(overlapState.fragments.some((fragment) => fragment.text === "overlap first"), "first overlap capture missing");
   assert(overlapState.fragments.some((fragment) => fragment.text === "overlap second"), "second overlap capture missing");
 
-  await seedFragments(101);
-  await reloadFrame();
-  assert(frameDoc().querySelectorAll("#stream .frag").length === 100, "rendered collection was not capped at 100");
+  const rows = Array.from({ length: 250 }, (_, index) => ({
+    id: "batch-" + index,
+    createdAt: index + 1,
+    text: "batch fragment " + index,
+  }));
+  rows[249] = {
+    id: "safe-text", createdAt: 250,
+    text: "<img src=x onerror=window.__ledgerXss=1>", source: "Needle notebook",
+  };
+  rows[248] = { id: "partial-match", createdAt: 249, text: "Needle only" };
+  rows[247] = { id: "deleted-match", createdAt: 248, text: "Needle notebook" };
+  await frameWin().__ledgerTest.seedFragments(rows);
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 100, "initial render did not stop at 100 fragments");
+  assert(frameDoc().querySelector("#stream h2"), "fragments were not grouped beneath a day heading");
+  frameDoc().querySelector("#loadMore").click();
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 200, "first Load more did not add exactly 100 fragments");
+  frameDoc().querySelector("#loadMore").click();
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 250, "second Load more did not render the remaining fragments");
+  const search = frameDoc().querySelector("#search");
+  search.value = "batch";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "h" }));
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 100, "query change did not reset the render batch to 100");
+  search.value = "";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+  fragmentButton("deleted-match").click();
+  await until(() => !fragmentButton("deleted-match"), "matching tombstone was not deleted before search");
+
+  search.value = "needle notebook";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "k" }));
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 1, "search did not require every token or exclude tombstones");
+  assert(frameDoc().querySelector("#counts").textContent === "1 match", "search count was not exact");
+  const safeFragment = frameDoc().querySelector("#stream .frag");
+  assert(safeFragment.textContent.includes("<img src=x onerror=window.__ledgerXss=1>"), "fragment HTML was not rendered as text");
+  assert(!safeFragment.querySelector("img"), "fragment HTML created an image element");
+  assert(safeFragment.querySelector("mark"), "matching text was not highlighted with mark");
+  frameDoc().querySelector("#undo").click();
+  await until(async () => {
+    const restored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === "deleted-match");
+    return restored && !Number.isFinite(restored.deletedAt);
+  }, "search tombstone was not restored after the assertion");
 
   const releaseWrites = await holdFragmentWrites();
   const previousDocument = frameDoc();
