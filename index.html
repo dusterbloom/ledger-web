@@ -548,7 +548,22 @@ function shouldAutofocusComposer(hasFinePointer, bodyHasFocus) {
   return hasFinePointer && bodyHasFocus;
 }
 
+function canMutate(db) {
+  return persistenceWritable && Boolean(database) && db === database;
+}
+
+function announceDraftNotSaved() {
+  if (draftFailureAnnounced) return;
+  draftFailureAnnounced = true;
+  if (isTestMode(location)) draftFailureAnnouncementCount += 1;
+  announce("Draft not saved. Your text is still here.");
+}
+
 async function saveDraft(db, text) {
+  if (!canMutate(db)) {
+    announceDraftNotSaved();
+    return false;
+  }
   try {
     const tx = db.transaction("meta", "readwrite");
     tx.objectStore("meta").put({ key: "draft", value: text });
@@ -558,13 +573,10 @@ async function saveDraft(db, text) {
     }
     await transactionDone(tx);
     draftFailureAnnounced = false;
+    return true;
   } catch (error) {
     if (error?.name === "QuotaExceededError") setRecoveryState("quota", error);
-    if (!draftFailureAnnounced) {
-      draftFailureAnnounced = true;
-      if (isTestMode(location)) draftFailureAnnouncementCount += 1;
-      announce("Draft not saved. Your text is still here.");
-    }
+    announceDraftNotSaved();
     throw error;
   }
 }
@@ -582,6 +594,11 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
   const normalized = normalizeText(text);
   if (!normalized) {
     announce("Nothing to keep.");
+    return null;
+  }
+
+  if (!canMutate(db)) {
+    announce("Fragment not saved. Your text is still here. Retry.");
     return null;
   }
 
@@ -628,6 +645,10 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
 }
 
 async function deleteFragment(id, now) {
+  if (!canMutate(database)) {
+    announce("Fragment not deleted. Retry.");
+    return null;
+  }
   const fragment = state.fragments.find((candidate) => candidate.id === id);
   if (!fragment || !isLive(fragment)) return null;
   const tombstone = { ...fragment, deletedAt: now, undoUntil: now + UNDO_WINDOW_MS };
@@ -648,6 +669,10 @@ async function deleteFragment(id, now) {
 }
 
 async function undoDelete(id, now) {
+  if (!canMutate(database)) {
+    announce("Fragment not restored. Retry Undo.");
+    return null;
+  }
   const fragment = state.fragments.find((candidate) => candidate.id === id);
   if (!fragment || isLive(fragment) || !Number.isFinite(fragment.undoUntil) || fragment.undoUntil <= now) {
     announce("Undo has expired.");
@@ -681,6 +706,14 @@ function flushDraft() {
   }
   if (!database) return Promise.resolve();
   return saveDraft(database, entry.value).catch(() => undefined);
+}
+
+function flushVisibilityDraft(visibilityState = document.visibilityState) {
+  return visibilityState === "hidden" ? flushDraft() : Promise.resolve();
+}
+
+function flushPageHideDraft() {
+  return flushDraft();
 }
 /* @testable:end */
 
@@ -727,7 +760,9 @@ function announce(message) {
 }
 
 function setRecoveryState(kind, details) {
+  const wasWritable = persistenceWritable;
   persistenceWritable = Boolean(database) && (kind === "ready" || kind === "malformed");
+  if (persistenceWritable && !wasWritable) draftFailureAnnounced = false;
   const canExport = hasVerifiedReadableSnapshot && (kind !== "quota" || state.fragments.length > 0);
   document.querySelector("#save").disabled = !persistenceWritable;
   importButton.disabled = !persistenceWritable;
@@ -754,6 +789,7 @@ function resizeEntry() {
 }
 
 async function restoreRows(rows, now = currentTime(), invalid = 0) {
+  if (!canMutate(database)) throw new DOMException("storage is read-only", "InvalidStateError");
   const plan = planRestore(state.fragments, rows, now);
   plan.invalid += invalid;
   const summary = await restoreBackup(database, plan);
@@ -808,7 +844,7 @@ function renderDeletedDialog(tombstones) {
 }
 
 async function expireDeleted() {
-  if (!database) return;
+  if (!canMutate(database)) return;
   try {
     if (shouldFailNextExpiryPurge) {
       shouldFailNextExpiryPurge = false;
@@ -1165,10 +1201,8 @@ exportMarkdown.addEventListener("click", async () => {
   }
 });
 
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden") void flushDraft();
-});
-window.addEventListener("pagehide", () => { void flushDraft(); });
+document.addEventListener("visibilitychange", () => { void flushVisibilityDraft(); });
+window.addEventListener("pagehide", () => { void flushPageHideDraft(); });
 
 const ready = retryStartup();
 
@@ -1200,6 +1234,12 @@ if (isTestMode(location)) {
     },
     draftFailureAnnouncements() {
       return draftFailureAnnouncementCount;
+    },
+    saveDraftDirect(text) {
+      return saveDraft(database, text);
+    },
+    appendFragmentDirect(text) {
+      return appendFragment(database, text);
     },
     async seedStoredOnly(rows) {
       if (!Array.isArray(rows)) throw new TypeError("rows must be an array");

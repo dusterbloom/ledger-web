@@ -97,6 +97,20 @@ function inputText(entry, value) {
   entry.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value.slice(-1) }));
 }
 
+function observeWriteTransactions() {
+  const prototype = frameWin().IDBDatabase.prototype;
+  const original = prototype.transaction;
+  let count = 0;
+  prototype.transaction = function (stores, mode) {
+    if (mode === "readwrite") count += 1;
+    return original.apply(this, arguments);
+  };
+  return {
+    count: () => count,
+    restore() { prototype.transaction = original; },
+  };
+}
+
 async function runFailureAndKeyboardChecks() {
   const entry = frameDoc().querySelector("#entry");
   assert(frameDoc().activeElement === entry, "fine-pointer startup did not focus the composer");
@@ -350,11 +364,69 @@ async function run() {
     && frameDoc().querySelector("#undo").disabled
     && frameDoc().querySelector("#recentlyDeleted").disabled,
   "readable startup quota left fragment mutation controls enabled");
+
+  const writeObserver = observeWriteTransactions();
+  const quotaEntry = frameDoc().querySelector("#entry");
+  const guardedText = "quota recovery edit must remain exact";
+  const readableBeforeMutationAttempts = JSON.stringify(await frameWin().__ledgerTest.readAll());
+  inputText(quotaEntry, guardedText);
+  assert(writeObserver.count() === 0, "input wrote to IndexedDB while persistence was read-only");
+  quotaEntry.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  await wait(50);
+  assert(writeObserver.count() === 0, "Control+Enter wrote to IndexedDB while persistence was read-only");
+  assert(quotaEntry.value === guardedText, "read-only Control+Enter changed the exact composer text");
+  quotaEntry.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", metaKey: true, bubbles: true, cancelable: true,
+  }));
+  await wait(50);
+  assert(writeObserver.count() === 0, "Command+Enter wrote to IndexedDB while persistence was read-only");
+  await wait(300);
+  assert(writeObserver.count() === 0, "draft debounce wrote to IndexedDB while persistence was read-only");
+  assert(frameDoc().querySelector("#status").textContent === "Draft not saved. Your text is still here.",
+    "read-only draft debounce falsely claimed durability");
+  Object.defineProperty(frameDoc(), "visibilityState", { configurable: true, value: "hidden" });
+  frameDoc().dispatchEvent(new (frameWin().Event)("visibilitychange"));
+  delete frameDoc().visibilityState;
+  frameWin().dispatchEvent(new (frameWin().PageTransitionEvent)("pagehide"));
+  await wait(25);
+  assert(writeObserver.count() === 0, "visibility/pagehide flush wrote while persistence was read-only");
+  await frameWin().__ledgerTest.saveDraftDirect("direct draft must not persist");
+  await frameWin().__ledgerTest.appendFragmentDirect("direct fragment must not persist");
+  assert(writeObserver.count() === 0, "direct mutation calls wrote while persistence was read-only");
+  assert(JSON.stringify(await frameWin().__ledgerTest.readAll()) === readableBeforeMutationAttempts,
+    "read-only recovery mutation attempts changed the verified database snapshot");
+  assert(quotaEntry.value === guardedText, "read-only mutation attempts changed the exact composer text");
+  const quotaEpisodeAnnouncements = frameWin().__ledgerTest.draftFailureAnnouncements();
+  writeObserver.restore();
+
   frameDoc().querySelector("#exportJson").click();
   await until(() => frameDoc().querySelector("#status").textContent === "Backup ready to download.",
     "readable startup quota Backup action did not work");
+  localStorage.removeItem("ledger.fragments");
+  frameDoc().querySelector("#retryStartup").click();
+  await until(() => frameDoc().querySelector("#recovery").hidden
+    && !frameDoc().querySelector("#save").disabled, "readable quota Retry did not restore writable persistence");
+  assert(frameDoc().querySelector("#entry").value === guardedText,
+    "readable quota Retry changed the exact in-memory composer text");
+  frameWin().__ledgerTest.failNextDraftTransactions(1);
+  await frameWin().__ledgerTest.saveDraftDirect(guardedText).catch(() => undefined);
+  assert(frameWin().__ledgerTest.draftFailureAnnouncements() === quotaEpisodeAnnouncements + 1,
+    "writable Retry did not start a new draft-failure announcement episode");
+  assert(frameDoc().querySelector("#entry").value === guardedText,
+    "failed post-Retry draft save changed the exact composer text");
+  frameDoc().querySelector("#entry").dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments
+    .filter((fragment) => fragment.text === guardedText).length === 1,
+  "composer did not save normally after readable quota Retry");
+  assert(frameDoc().querySelector("#entry").value === "",
+    "successful post-Retry save did not clear the composer");
   frameWin().__ledgerTest.closeDatabase();
   await deleteDatabase("ledger-web");
+  localStorage.setItem("ledger.fragments", malformedLegacy);
   frameWin().sessionStorage.setItem("ledger.testStartupFailure", "quota-before-open");
   await reloadFrame();
   assert(!/backup|markdown/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
