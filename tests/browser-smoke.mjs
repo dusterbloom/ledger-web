@@ -23,6 +23,18 @@ async function runCleanups(actions) {
   }
   if (errors.length) throw new AggregateError(errors, "Browser cleanup failed");
 }
+
+function browserFailureFromEvent(method, params) {
+  if (method === "Runtime.exceptionThrown") {
+    const details = params?.exceptionDetails;
+    return details?.exception?.description || details?.text || "Uncaught page exception";
+  }
+  if (method === "Runtime.consoleAPICalled" && ["error", "assert"].includes(params?.type)) {
+    return (params.args || []).map((argument) => argument.value ?? argument.description ?? "[value]").join(" ")
+      || "Page console error";
+  }
+  return null;
+}
 /* @testable-runner:end */
 
 function withDeadline(promise, deadline, message) {
@@ -142,13 +154,17 @@ async function connectCdp(url, deadline) {
 
   let nextId = 0;
   const pending = new Map();
+  const listeners = new Map();
   socket.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
-    if (!message.id || !pending.has(message.id)) return;
-    const { resolveCall, rejectCall } = pending.get(message.id);
-    pending.delete(message.id);
-    if (message.error) rejectCall(new Error(message.error.message));
-    else resolveCall(message.result);
+    if (message.id && pending.has(message.id)) {
+      const { resolveCall, rejectCall } = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) rejectCall(new Error(message.error.message));
+      else resolveCall(message.result);
+      return;
+    }
+    for (const listener of listeners.get(message.method) || []) listener(message.params);
   });
   socket.addEventListener("close", () => {
     for (const { rejectCall } of pending.values()) rejectCall(new Error("DevTools WebSocket closed"));
@@ -157,6 +173,11 @@ async function connectCdp(url, deadline) {
 
   return {
     close: () => socket.close(),
+    on(method, listener) {
+      if (!listeners.has(method)) listeners.set(method, new Set());
+      listeners.get(method).add(listener);
+      return () => listeners.get(method)?.delete(listener);
+    },
     call(method, params = {}) {
       const id = ++nextId;
       return new Promise((resolveCall, rejectCall) => {
@@ -234,7 +255,16 @@ try {
   const devtoolsUrl = await browser.devtools;
   const targetUrl = await findHarness(devtoolsUrl, harnessUrl, deadline);
   cdp = await connectCdp(targetUrl, deadline);
+  const browserFailures = [];
+  for (const method of ["Runtime.exceptionThrown", "Runtime.consoleAPICalled"]) {
+    cdp.on(method, (params) => {
+      const failure = browserFailureFromEvent(method, params);
+      if (failure) browserFailures.push(failure);
+    });
+  }
+  await cdp.call("Runtime.enable");
   await waitForHarness(cdp, deadline);
+  if (browserFailures.length) throw new Error("Browser page errors:\n" + browserFailures.join("\n"));
   console.log(focus === "overlap"
     ? "PASS: overlapping captures left no stale draft"
     : focus === "restore"

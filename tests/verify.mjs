@@ -38,9 +38,55 @@ test("release is one offline HTML file with no cross-frame API", () => {
   assert.doesNotThrow(() => new Function(script));
 });
 
+test("release closes document trust boundaries with a restrictive CSP", () => {
+  const html = readApp();
+  const script = inlineScript(html);
+  const policy = html.match(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/i)?.[1];
+  assert.ok(policy, "Content Security Policy meta tag missing");
+  for (const directive of [
+    "default-src 'none'", "script-src 'unsafe-inline'", "style-src 'unsafe-inline'",
+    "font-src data:", "img-src data:", "connect-src 'none'", "media-src 'none'",
+    "object-src 'none'", "frame-src 'none'", "base-uri 'none'", "form-action 'none'",
+  ]) assert.match(policy, new RegExp(directive.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(script, /\binnerHTML\b|\beval\s*\(|new\s+Function\b/);
+  assert.doesNotMatch(html, /\son[a-z]+\s*=/i);
+  assert.doesNotMatch(script, /\bconsole\s*\.|\b(?:localStorage|sessionStorage)\s*\.\s*setItem\([^)]*fragment/i);
+});
+
+test("storage errors produce distinct actionable recovery copy", () => {
+  const { describeStorageError } = extractTestableLogic(readApp(), ["describeStorageError"]);
+  const quota = describeStorageError({ name: "QuotaExceededError" });
+  const blocked = describeStorageError(new Error("database-blocked"));
+  const restricted = describeStorageError({ name: "SecurityError" });
+  const malformed = describeStorageError(new Error("legacy-malformed"));
+  const generic = describeStorageError(new Error("transaction-failed"));
+  assert.match(quota, /backup|markdown/i);
+  assert.match(blocked, /other Ledger tabs/i);
+  assert.match(blocked, /retry/i);
+  assert.match(restricted, /browser|private|storage/i);
+  assert.match(malformed, /legacy|download/i);
+  assert.match(generic, /not saved|retry/i);
+  assert.equal(new Set([quota, blocked, restricted, malformed, generic]).size, 5);
+});
+
+test("responsive accessibility keeps controls visible and respects user settings", () => {
+  const html = readApp();
+  for (const id of ["recovery", "retryStartup", "downloadLegacy"]) {
+    assert.match(html, new RegExp('id="' + id + '"'), id + " missing");
+  }
+  assert.match(html, /@media\s*\(prefers-reduced-motion\s*:\s*reduce\)/i);
+  assert.match(html, /@media\s*\(forced-colors\s*:\s*active\)/i);
+  assert.match(html, /@media\s*\(pointer\s*:\s*coarse\)[\s\S]*?min-(?:width|height)\s*:\s*44px/i);
+  assert.match(html, /#entry,#search\s*\{[^}]*font-size\s*:\s*max\(16px/i);
+  for (const side of ["top", "right", "bottom", "left"]) {
+    assert.match(html, new RegExp("env\\(safe-area-inset-" + side + "\\)"));
+  }
+  assert.doesNotMatch(html, /\.drop\s*\{[^}]*opacity\s*:\s*0(?:[;}])/i);
+});
+
 test("capture, search, stream, status, and recovery controls are semantic", () => {
   const html = readApp();
-  for (const id of ["entry", "save", "search", "stream", "status", "recentlyDeleted"]) {
+  for (const id of ["entry", "save", "search", "stream", "status", "recentlyDeleted", "retryStartup"]) {
     assert.match(html, new RegExp('id="' + id + '"'), id + " missing");
   }
   assert.match(html, /<label[^>]*for="entry"/);
@@ -142,6 +188,17 @@ test("stored drafts restore only when startup observed no user input", () => {
   entry.value = "";
   assert.equal(restoreDraft(entry, "  stored exactly\n", 2, 2), true);
   assert.equal(entry.value, "  stored exactly\n");
+
+  entry.value = "typed before retry";
+  assert.equal(restoreDraft(entry, "older stored draft", 3, 3), false);
+  assert.equal(entry.value, "typed before retry");
+});
+
+test("composer autofocus is limited to fine pointers with no existing focus", () => {
+  const { shouldAutofocusComposer } = extractTestableLogic(readApp(), ["shouldAutofocusComposer"]);
+  assert.equal(shouldAutofocusComposer(true, true), true);
+  assert.equal(shouldAutofocusComposer(false, true), false);
+  assert.equal(shouldAutofocusComposer(true, false), false);
 });
 
 test("backup preserves stored fields and excludes only expired tombstones", () => {
@@ -319,4 +376,17 @@ test("browser cleanup attempts every resource after an earlier failure", async (
     async () => { calls.push("profile"); },
   ]), AggregateError);
   assert.deepEqual(calls, ["chromium", "server", "profile"]);
+});
+
+test("browser runner classifies uncaught exceptions and error-console events", () => {
+  const { browserFailureFromEvent } = extractRunnerLogic(["browserFailureFromEvent"]);
+  assert.match(browserFailureFromEvent("Runtime.exceptionThrown", {
+    exceptionDetails: { text: "Uncaught", exception: { description: "Error: broken page" } },
+  }), /broken page/);
+  assert.match(browserFailureFromEvent("Runtime.consoleAPICalled", {
+    type: "error", args: [{ value: "unsafe failure" }],
+  }), /unsafe failure/);
+  assert.equal(browserFailureFromEvent("Runtime.consoleAPICalled", {
+    type: "log", args: [{ value: "ordinary diagnostic" }],
+  }), null);
 });

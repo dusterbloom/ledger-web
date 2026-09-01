@@ -70,6 +70,70 @@ async function reloadFrame() {
   await ready();
 }
 
+function inputText(entry, value) {
+  entry.value = value;
+  entry.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value.slice(-1) }));
+}
+
+async function runFailureAndKeyboardChecks() {
+  const entry = frameDoc().querySelector("#entry");
+  assert(frameDoc().activeElement === entry, "fine-pointer startup did not focus the composer");
+  assert(getComputedStyle(frameDoc().querySelector("#undoToast")).display === "none",
+    "hidden Undo toast remained visually exposed");
+
+  const search = frameDoc().querySelector("#search");
+  search.value = "select me";
+  frameDoc().dispatchEvent(new KeyboardEvent("keydown", {
+    key: "f", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  assert(frameDoc().activeElement === search, "Control+F did not focus Ledger search");
+  assert(search.selectionStart === 0 && search.selectionEnd === search.value.length,
+    "Control+F did not select the search query");
+  frameDoc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  assert(search.value === "", "Escape did not clear Ledger search");
+  frameDoc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  assert(frameDoc().activeElement === entry, "Escape with no search did not focus the composer");
+  const plainEnter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  entry.dispatchEvent(plainEnter);
+  assert(!plainEnter.defaultPrevented, "plain Enter was prevented instead of remaining a newline");
+
+  inputText(entry, "must remain");
+  frameWin().__ledgerTest.failNextCaptureTransaction();
+  frameDoc().querySelector("#save").click();
+  await until(() => frameDoc().querySelector("#status").textContent.includes("not saved"),
+    "aborted capture did not report that it was not saved");
+  assert(entry.value === "must remain", "aborted capture changed the exact composer text");
+  assert((await frameWin().__ledgerTest.readAll()).fragments.length === 0,
+    "aborted capture left a durable fragment");
+
+  frameDoc().querySelector("#save").click();
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 1,
+    "capture retry did not commit");
+  const retried = await frameWin().__ledgerTest.readAll();
+  assert(retried.fragments.length === 1 && retried.fragments[0].text === "must remain",
+    "capture retry did not create exactly one durable fragment");
+  assert(frameDoc().activeElement === entry, "successful save did not restore composer focus");
+
+  const announcementsBefore = frameWin().__ledgerTest.draftFailureAnnouncements();
+  frameWin().__ledgerTest.failNextDraftTransactions(2);
+  inputText(entry, "first failed draft");
+  await wait(300);
+  inputText(entry, "second failed draft");
+  await wait(300);
+  assert(frameWin().__ledgerTest.draftFailureAnnouncements() === announcementsBefore + 1,
+    "one draft failure episode announced more than once");
+  inputText(entry, "draft recovery");
+  await until(async () => (await frameWin().__ledgerTest.readAll()).draft === "draft recovery",
+    "draft did not recover after injected failures");
+  frameWin().__ledgerTest.failNextDraftTransactions(1);
+  inputText(entry, "new failed episode");
+  await wait(300);
+  assert(frameWin().__ledgerTest.draftFailureAnnouncements() === announcementsBefore + 2,
+    "a new draft failure episode was not announced");
+
+  await frameWin().__ledgerTest.resetState();
+}
+
 async function runFocusedOverlap() {
   const releaseCaptures = await holdFragmentWrites();
   const entry = frameDoc().querySelector("#entry");
@@ -160,6 +224,7 @@ async function runDeletionChecks() {
     const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
     return stored?.deletedAt === baseNow && stored?.undoUntil === baseNow + 30000;
   }, "delete was not persisted as a 30-second tombstone");
+  assert(frameDoc().activeElement === frameDoc().querySelector("#undo"), "Delete did not move focus to Undo");
   assert(!fragmentButton(first.id), "deleted fragment remained visible");
 
   await reloadFrame();
@@ -173,6 +238,7 @@ async function runDeletionChecks() {
     return stored && !Number.isFinite(stored.deletedAt);
   }, "Undo did not restore the durable fragment");
   assert(fragmentButton(first.id), "Undo did not restore the fragment chronologically");
+  assert(frameDoc().activeElement === fragmentButton(first.id), "Undo did not focus the restored fragment Delete control");
 
   frameWin().__ledgerTest.setNow(baseNow + 10);
   fragmentButton(first.id).click();
@@ -184,6 +250,11 @@ async function runDeletionChecks() {
   assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "toast did not target the newest deletion");
   frameDoc().querySelector("#recentlyDeleted").click();
   assert(undoButton(first.id) && undoButton(second.id), "not every recent deletion was accessible");
+  frameDoc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  assert(!frameDoc().querySelector("#deletedDialog").open, "Escape did not close the open dialog");
+  assert(frameDoc().activeElement === frameDoc().querySelector("#recentlyDeleted"),
+    "closing the dialog did not restore trigger focus");
+  frameDoc().querySelector("#recentlyDeleted").click();
   undoButton(first.id).click();
   await until(() => Boolean(undoButton(second.id)), "remaining deletion disappeared after another Undo");
   undoButton(second.id).click();
@@ -225,12 +296,33 @@ async function run() {
   result.textContent = "deleting database";
   await deleteDatabase("ledger-web");
   localStorage.clear();
+  const malformedLegacy = "{ untouched malformed legacy";
+  localStorage.setItem("ledger.fragments", malformedLegacy);
+  sessionStorage.setItem("ledger.testStartupFailure", "blocked");
   result.textContent = "loading application";
   const loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
   frame.src = "../index.html?test=1";
   document.body.append(frame);
   await loaded;
   await ready();
+  assert(!frameDoc().querySelector("#recovery").hidden, "blocked startup recovery was not shown");
+  assert(/other Ledger tabs/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
+    "blocked startup did not explain how to unblock storage");
+  assert(frameDoc().querySelector("#save").disabled && frameDoc().querySelector("#import").disabled,
+    "blocked startup left persistence actions enabled");
+  assert(!frameDoc().querySelector("#entry").hidden, "blocked startup hid the composer");
+  frameDoc().querySelector("#retryStartup").click();
+  await until(() => !frameDoc().querySelector("#downloadLegacy").hidden,
+    "retry after blocked startup did not reach malformed legacy recovery");
+  assert(localStorage.getItem("ledger.fragments") === malformedLegacy,
+    "malformed legacy data changed during startup");
+  assert(!frameDoc().querySelector("#recovery").hidden, "malformed legacy recovery was not shown");
+  assert(!frameDoc().querySelector("#downloadLegacy").hidden,
+    "malformed legacy recovery did not offer the raw download");
+  localStorage.removeItem("ledger.fragments");
+  frameDoc().querySelector("#retryStartup").click();
+  await until(() => frameDoc().querySelector("#recovery").hidden
+    && !frameDoc().querySelector("#save").disabled, "startup retry did not recover");
   const focus = new URL(location.href).searchParams.get("focus");
   if (focus === "overlap") {
     await runFocusedOverlap();
@@ -240,6 +332,8 @@ async function run() {
     await runFocusedRestore();
     return;
   }
+
+  await runFailureAndKeyboardChecks();
 
   result.textContent = "saving draft";
   const entry = frameDoc().querySelector("#entry");
@@ -329,6 +423,8 @@ async function run() {
   await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 4,
     "text blocks were not imported in one selection");
   assert(fileInput.value === "", "file input did not reset after import");
+  assert(frameDoc().activeElement === frameDoc().querySelector("#import"),
+    "returning from import did not restore focus to Import");
   const textImportState = await frameWin().__ledgerTest.readAll();
   const textRows = textImportState.fragments.filter((row) => row.source === "from notes.txt")
     .sort((a, b) => a.createdAt - b.createdAt);
@@ -376,6 +472,24 @@ async function run() {
     const restored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === "deleted-match");
     return restored && !Number.isFinite(restored.deletedAt);
   }, "search tombstone was not restored after the assertion");
+  assert(frameDoc().activeElement === fragmentButton("deleted-match"),
+    "Undo did not focus its restored visible fragment");
+
+  search.value = "";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+  fragmentButton("safe-text").click();
+  await until(() => !fragmentButton("safe-text"), "offscreen focus setup did not delete its fragment");
+  search.value = "no fragment can match this query";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "y" }));
+  frameDoc().querySelector("#undo").click();
+  await until(async () => {
+    const restored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === "safe-text");
+    return restored && !Number.isFinite(restored.deletedAt);
+  }, "offscreen fragment was not restored");
+  assert(frameDoc().activeElement === frameDoc().querySelector("#entry"),
+    "Undo did not focus the composer when its restored fragment was offscreen");
+  search.value = "";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
 
   const releaseWrites = await holdFragmentWrites();
   const previousDocument = frameDoc();
