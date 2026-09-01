@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const appPath = resolve(root, "index.html");
+const browserPath = resolve(root, "tests/browser-smoke.mjs");
 const readApp = () => readFileSync(appPath, "utf8");
 
 function inlineScript(html) {
@@ -17,6 +18,13 @@ function inlineScript(html) {
 function extractTestableLogic(html, names) {
   const match = html.match(/\/\* @testable:start \*\/([\s\S]*?)\/\* @testable:end \*\//);
   assert.ok(match, "testable logic block missing");
+  return new Function(match[1] + "; return { " + names.join(", ") + " }; ")();
+}
+
+function extractRunnerLogic(names) {
+  const script = readFileSync(browserPath, "utf8");
+  const match = script.match(/\/\* @testable-runner:start \*\/([\s\S]*?)\/\* @testable-runner:end \*\//);
+  assert.ok(match, "testable runner block missing");
   return new Function(match[1] + "; return { " + names.join(", ") + " }; ")();
 }
 
@@ -86,4 +94,26 @@ test("test helpers require both an explicit flag and a loopback hostname", () =>
   assert.equal(isTestMode({ href: "http://localhost/index.html?test", hostname: "localhost" }), true);
   assert.equal(isTestMode({ href: "http://127.0.0.1/index.html", hostname: "127.0.0.1" }), false);
   assert.equal(isTestMode({ href: "https://ledger.example/index.html?test=1", hostname: "ledger.example" }), false);
+});
+
+test("stored drafts restore only when startup observed no user input", () => {
+  const { restoreDraft } = extractTestableLogic(readApp(), ["restoreDraft"]);
+  const entry = { value: "typed while loading" };
+  assert.equal(restoreDraft(entry, "stored draft", 0, 1), false);
+  assert.equal(entry.value, "typed while loading");
+
+  entry.value = "";
+  assert.equal(restoreDraft(entry, "  stored exactly\n", 2, 2), true);
+  assert.equal(entry.value, "  stored exactly\n");
+});
+
+test("browser cleanup attempts every resource after an earlier failure", async () => {
+  const { runCleanups } = extractRunnerLogic(["runCleanups"]);
+  const calls = [];
+  await assert.rejects(() => runCleanups([
+    async () => { calls.push("chromium"); throw new Error("stop failed"); },
+    async () => { calls.push("server"); },
+    async () => { calls.push("profile"); },
+  ]), AggregateError);
+  assert.deepEqual(calls, ["chromium", "server", "profile"]);
 });

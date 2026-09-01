@@ -11,6 +11,20 @@ const chromium = process.env.CHROMIUM_BIN || "/opt/homebrew/bin/chromium";
 const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8" };
 const wait = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 
+/* @testable-runner:start */
+async function runCleanups(actions) {
+  const errors = [];
+  for (const action of actions) {
+    try {
+      await action();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length) throw new AggregateError(errors, "Browser cleanup failed");
+}
+/* @testable-runner:end */
+
 function withDeadline(promise, deadline, message) {
   let timeout;
   const expired = new Promise((_, reject) => {
@@ -165,7 +179,7 @@ async function evaluate(cdp, expression, deadline) {
 
 async function waitForHarness(cdp, deadline) {
   while (Date.now() < deadline) {
-    const status = await evaluate(cdp, "document.body.dataset.status", deadline);
+    const status = await evaluate(cdp, "document.body?.dataset.status || 'running'", deadline);
     if (status === "pass") return;
     if (status === "fail") {
       const result = await evaluate(cdp, "document.querySelector('#result').textContent", deadline);
@@ -219,13 +233,15 @@ try {
   const targetUrl = await findHarness(devtoolsUrl, harnessUrl, deadline);
   cdp = await connectCdp(targetUrl, deadline);
   await waitForHarness(cdp, deadline);
-  console.log("PASS: recovered one draft and committed one fragment");
+  console.log("PASS: recovered drafts, preserved pending edits, and capped rendering");
 } catch (error) {
   if (browser?.stderr()) error.message += "\n" + browser.stderr();
   throw error;
 } finally {
-  cdp?.close();
-  await stopChromium(browser?.child);
-  await close(server);
-  if (profile) await rm(profile, { recursive: true, force: true });
+  await runCleanups([
+    async () => cdp?.close(),
+    async () => stopChromium(browser?.child),
+    async () => close(server),
+    async () => { if (profile) await rm(profile, { recursive: true, force: true }); },
+  ]);
 }

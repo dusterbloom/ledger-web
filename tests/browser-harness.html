@@ -20,6 +20,52 @@ function deleteDatabase(name) {
   });
 }
 
+async function seedFragments(count) {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("ledger-web");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const tx = db.transaction("fragments", "readwrite");
+  for (let index = 0; index < count; index += 1) {
+    tx.objectStore("fragments").put({
+      id: "batch-" + index,
+      createdAt: index + 1,
+      text: "batch fragment " + index,
+    });
+  }
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error("seed transaction failed"));
+  });
+  db.close();
+}
+
+async function holdFragmentWrites() {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("ledger-web");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const tx = db.transaction("fragments", "readwrite");
+  const store = tx.objectStore("fragments");
+  let released = false;
+  const done = new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error("hold transaction failed"));
+  });
+  function keepAlive() {
+    const request = store.get("hold");
+    request.onsuccess = () => { if (!released) keepAlive(); };
+  }
+  keepAlive();
+  return async () => {
+    released = true;
+    await done;
+    db.close();
+  };
+}
+
 async function until(check, message = "condition timed out") {
   const deadline = performance.now() + 5000;
   while (performance.now() < deadline) {
@@ -76,9 +122,41 @@ async function run() {
   const state = await frameWin().__ledgerTest.readAll();
   assert(state.fragments[0].text === "draft survives", "committed fragment text changed");
   assert(state.draft === "", "draft was not cleared atomically");
+
+  const pending = frameDoc().querySelector("#entry");
+  pending.value = "submitted snapshot";
+  pending.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "t" }));
+  pending.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  pending.value = "typed during save";
+  pending.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "e" }));
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 2);
+  assert(pending.value === "typed during save", "newer composer text was erased");
+  await wait(400);
+  const pendingState = await frameWin().__ledgerTest.readAll();
+  assert(pendingState.fragments.some((fragment) => fragment.text === "submitted snapshot"), "submitted snapshot changed");
+  assert(pendingState.draft === "typed during save", "newer composer text was not persisted");
+
+  await seedFragments(101);
+  await reloadFrame();
+  assert(frameDoc().querySelectorAll("#stream .frag").length === 100, "rendered collection was not capped at 100");
+
+  const releaseWrites = await holdFragmentWrites();
+  const previousDocument = frameDoc();
+  const loadedWithInput = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
+  frameWin().location.reload();
+  await until(() => frameDoc() !== previousDocument && Boolean(frameWin()?.__ledgerTest), "reloaded test interface missing");
+  const startupEntry = frameDoc().querySelector("#entry");
+  startupEntry.value = "typed before restore";
+  startupEntry.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "e" }));
+  await releaseWrites();
+  await loadedWithInput;
+  await frameWin().__ledgerTest.ready;
+  assert(startupEntry.value === "typed before restore", "startup draft overwrote newer user input");
   frameWin().__ledgerTest.closeDatabase();
   document.body.dataset.status = "pass";
-  result.textContent = "recovered one draft and committed one fragment";
+  result.textContent = "recovered drafts, preserved pending edits, and capped rendering";
 }
 
 run().catch((error) => {

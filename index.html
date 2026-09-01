@@ -225,6 +225,12 @@ function isTestMode(currentLocation) {
     && (hostname === "127.0.0.1" || hostname === "localhost");
 }
 
+function restoreDraft(input, draft, initialRevision, currentRevision) {
+  if (currentRevision !== initialRevision) return false;
+  input.value = draft;
+  return true;
+}
+
 async function saveDraft(db, text) {
   try {
     const tx = db.transaction("meta", "readwrite");
@@ -241,6 +247,7 @@ async function saveDraft(db, text) {
 }
 
 async function appendFragment(db, text, source) {
+  const submittedText = text;
   const normalized = normalizeText(text);
   if (!normalized) {
     announce("Nothing to keep.");
@@ -268,10 +275,18 @@ async function appendFragment(db, text, source) {
   }
 
   state.fragments.unshift(fragment);
-  entry.value = "";
+  const hasNewerText = entry.value !== submittedText;
+  if (!hasNewerText) entry.value = "";
   resizeEntry();
   render();
   announce("Fragment kept.");
+  if (hasNewerText) {
+    if (draftTimer !== null) {
+      clearTimeout(draftTimer);
+      draftTimer = null;
+    }
+    await saveDraft(db, entry.value).catch(() => undefined);
+  }
   return fragment;
 }
 
@@ -292,6 +307,7 @@ const status = document.querySelector("#status");
 let database;
 let draftTimer = null;
 let draftFailureAnnounced = false;
+let inputRevision = 0;
 let state = { fragments: [] };
 
 function announce(message) {
@@ -306,7 +322,7 @@ function resizeEntry() {
 function render() {
   stream.replaceChildren();
   const visible = state.fragments.filter(isLive);
-  for (const fragment of visible) {
+  for (const fragment of visible.slice(0, 100)) {
     const article = document.createElement("article");
     article.className = "frag";
     const time = document.createElement("time");
@@ -322,11 +338,12 @@ function render() {
 }
 
 async function start() {
+  const initialRevision = inputRevision;
   database = await openDatabase();
   await migrateLegacy(database);
   const loaded = await loadState(database, Date.now());
   state = { fragments: loaded.fragments };
-  entry.value = loaded.draft;
+  restoreDraft(entry, loaded.draft, initialRevision, inputRevision);
   resizeEntry();
   render();
 }
@@ -343,6 +360,7 @@ async function readAll() {
 }
 
 entry.addEventListener("input", () => {
+  inputRevision += 1;
   if (draftTimer !== null) clearTimeout(draftTimer);
   draftTimer = setTimeout(() => { void flushDraft(); }, 250);
   resizeEntry();
