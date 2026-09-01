@@ -293,7 +293,9 @@ git commit -m "feat: add transactional IndexedDB storage"
 
 - [ ] **Step 1: Create the browser runner and a failing capture scenario**
 
-`tests/browser-smoke.mjs` must start a loopback-only Node HTTP server rooted at the repository, spawn `/opt/homebrew/bin/chromium` (or `CHROMIUM_BIN`) with a fresh temporary user-data directory, `--headless=new`, `--disable-gpu`, `--dump-dom`, and `--virtual-time-budget=8000`, then assert the dumped harness contains `data-status="pass"`. Always close the server and remove only the runner-created temporary directory in `finally`.
+`tests/browser-smoke.mjs` must start a loopback-only Node HTTP server rooted at the repository, spawn `/opt/homebrew/bin/chromium` (or `CHROMIUM_BIN`) with a fresh temporary user-data directory, `--headless=new`, `--disable-gpu`, and `--remote-debugging-port=0`. Parse Chromium's loopback DevTools URL, use Node's built-in `WebSocket` and `fetch` to connect to the harness page, and poll `document.body.dataset.status` under real wall-clock time until it is `pass`, `fail`, or the bounded timeout expires. Always close Chromium and the server and remove only the runner-created temporary directory in `finally`.
+
+The CDP runner replaces the originally proposed `--dump-dom --virtual-time-budget` mechanism. A minimal reproduction confirmed that virtual-time dump-DOM mode advances timers while starving IndexedDB callbacks; the same page reaches `data-status="pass"` immediately under real-time CDP control. This correction was approved by the user on 2026-09-01.
 
 `tests/browser-harness.html` must clear `indexedDB.deleteDatabase("ledger-web")` and localStorage, create an iframe for `../index.html?test=1`, await `frame.contentWindow.__ledgerTest.ready`, then perform:
 
