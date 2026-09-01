@@ -118,6 +118,76 @@ async function runFocusedOverlap() {
   result.textContent = "overlapping captures left no stale draft";
 }
 
+function fragmentButton(id) {
+  return [...frameDoc().querySelectorAll("#stream .drop")]
+    .find((button) => button.dataset.fragmentId === id);
+}
+
+function undoButton(id) {
+  return [...frameDoc().querySelectorAll("#deletedDialog [data-undo-id]")]
+    .find((button) => button.dataset.undoId === id);
+}
+
+async function runDeletionChecks() {
+  const initial = await frameWin().__ledgerTest.readAll();
+  const visibleIds = [...frameDoc().querySelectorAll("#stream .drop")]
+    .map((button) => button.dataset.fragmentId);
+  const [first, second] = visibleIds
+    .map((id) => initial.fragments.find((fragment) => fragment.id === id));
+  assert(first && second, "deletion checks need two live fragments");
+
+  const baseNow = Date.now();
+  frameWin().__ledgerTest.setNow(baseNow);
+  fragmentButton(first.id).click();
+  await until(async () => {
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
+    return stored?.deletedAt === baseNow && stored?.undoUntil === baseNow + 30000;
+  }, "delete was not persisted as a 30-second tombstone");
+  assert(!fragmentButton(first.id), "deleted fragment remained visible");
+
+  await reloadFrame();
+  const recentlyDeleted = frameDoc().querySelector("#recentlyDeleted");
+  assert(!recentlyDeleted.hidden, "recently deleted control did not survive reload");
+  recentlyDeleted.click();
+  assert(frameDoc().querySelector("#deletedDialog").open, "recently deleted dialog did not open");
+  undoButton(first.id).click();
+  await until(async () => {
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
+    return stored && !Number.isFinite(stored.deletedAt);
+  }, "Undo did not restore the durable fragment");
+  assert(fragmentButton(first.id), "Undo did not restore the fragment chronologically");
+
+  frameWin().__ledgerTest.setNow(baseNow + 10);
+  fragmentButton(first.id).click();
+  await until(() => !fragmentButton(first.id), "first consecutive deletion stayed visible");
+  frameWin().__ledgerTest.setNow(baseNow + 11);
+  fragmentButton(second.id).click();
+  await until(() => !fragmentButton(second.id), "second consecutive deletion stayed visible");
+  assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 30010, "nearest tombstone expiry was not scheduled");
+  frameDoc().querySelector("#recentlyDeleted").click();
+  assert(undoButton(first.id) && undoButton(second.id), "not every recent deletion was accessible");
+  undoButton(first.id).click();
+  await until(() => Boolean(undoButton(second.id)), "remaining deletion disappeared after another Undo");
+  undoButton(second.id).click();
+  await until(() => fragmentButton(first.id) && fragmentButton(second.id), "consecutive deletions were not both restored");
+
+  frameWin().__ledgerTest.setNow(baseNow + 100);
+  fragmentButton(first.id).click();
+  await until(() => !fragmentButton(first.id), "fragment stayed visible before expiry test");
+  assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 30100, "expiry timer used the wrong deadline");
+  frameWin().__ledgerTest.setNow(baseNow + 30101);
+  await frameWin().__ledgerTest.fireExpiryTimer();
+  await until(async () => {
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
+    return !stored;
+  }, "nearest-expiry cleanup did not purge the tombstone in-session");
+  assert(frameDoc().querySelector("#undoToast").hidden, "expired Undo toast remained visible");
+  assert(frameDoc().querySelector("#recentlyDeleted").hidden, "expired recently deleted control remained visible");
+  await reloadFrame();
+  const expired = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === first.id);
+  assert(!expired, "expired tombstone survived reload cleanup");
+}
+
 async function run() {
   result.textContent = "deleting database";
   await deleteDatabase("ledger-web");
@@ -206,9 +276,11 @@ async function run() {
   await loadedWithInput;
   await frameWin().__ledgerTest.ready;
   assert(startupEntry.value === "typed before restore", "startup draft overwrote newer user input");
+  result.textContent = "checking persistent deletion and Undo";
+  await runDeletionChecks();
   frameWin().__ledgerTest.closeDatabase();
   document.body.dataset.status = "pass";
-  result.textContent = "recovered drafts, preserved pending edits, and capped rendering";
+  result.textContent = "recovered drafts, capped rendering, and verified persistent deletion Undo";
 }
 
 run().catch((error) => {

@@ -91,6 +91,8 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 const DB_NAME = "ledger-web";
 const DB_VERSION = 1;
 const LEGACY_KEY = "ledger.fragments";
+const UNDO_WINDOW_MS = 30000;
+const TEST_NOW_KEY = "ledger.testNow";
 
 function hasValidTimestamp(value) {
   return Number.isFinite(value) && value >= 0;
@@ -141,6 +143,14 @@ function isLive(fragment) {
   return !Number.isFinite(fragment.deletedAt);
 }
 
+function unexpiredTombstones(fragments, now) {
+  return fragments
+    .filter((fragment) => Number.isFinite(fragment.deletedAt)
+      && Number.isFinite(fragment.undoUntil)
+      && fragment.undoUntil > now)
+    .sort((a, b) => b.deletedAt - a.deletedAt || b.createdAt - a.createdAt);
+}
+
 function openDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -169,6 +179,20 @@ function transactionDone(tx) {
     tx.oncomplete = () => resolve();
     tx.onabort = tx.onerror = () => reject(tx.error || new Error("transaction-failed"));
   });
+}
+
+async function purgeExpired(db, now) {
+  const tx = db.transaction("fragments", "readwrite");
+  const store = tx.objectStore("fragments");
+  const fragments = await requestResult(store.getAll());
+  const expiredIds = fragments
+    .filter((fragment) => !isLive(fragment)
+      && Number.isFinite(fragment.undoUntil)
+      && fragment.undoUntil <= now)
+    .map((fragment) => fragment.id);
+  for (const id of expiredIds) store.delete(id);
+  await transactionDone(tx);
+  return expiredIds;
 }
 
 async function migrateLegacy(db) {
@@ -201,28 +225,30 @@ async function migrateLegacy(db) {
 }
 
 async function loadState(db, now) {
-  const tx = db.transaction(["fragments", "meta"], "readwrite");
-  const fragmentStore = tx.objectStore("fragments");
+  await purgeExpired(db, now);
+  const tx = db.transaction(["fragments", "meta"], "readonly");
   const [storedFragments, draftRecord] = await Promise.all([
-    requestResult(fragmentStore.getAll()),
+    requestResult(tx.objectStore("fragments").getAll()),
     requestResult(tx.objectStore("meta").get("draft")),
   ]);
-  const fragments = storedFragments.filter((fragment) => {
-    const expired = !isLive(fragment)
-      && Number.isFinite(fragment.undoUntil)
-      && fragment.undoUntil <= now;
-    if (expired) fragmentStore.delete(fragment.id);
-    return !expired;
-  });
   await transactionDone(tx);
-  fragments.sort((a, b) => b.createdAt - a.createdAt);
-  return { fragments, draft: typeof draftRecord?.value === "string" ? draftRecord.value : "" };
+  storedFragments.sort((a, b) => b.createdAt - a.createdAt);
+  return { fragments: storedFragments, draft: typeof draftRecord?.value === "string" ? draftRecord.value : "" };
 }
 
 function isTestMode(currentLocation) {
   const hostname = currentLocation.hostname;
   return new URL(currentLocation.href).searchParams.has("test")
     && (hostname === "127.0.0.1" || hostname === "localhost");
+}
+
+function currentTime() {
+  if (isTestMode(location)) {
+    const stored = sessionStorage.getItem(TEST_NOW_KEY);
+    const overridden = stored === null ? NaN : Number(stored);
+    if (hasValidTimestamp(overridden)) return overridden;
+  }
+  return Date.now();
 }
 
 function restoreDraft(input, draft, initialRevision, currentRevision) {
@@ -298,6 +324,47 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
   return fragment;
 }
 
+async function deleteFragment(id, now) {
+  const fragment = state.fragments.find((candidate) => candidate.id === id);
+  if (!fragment || !isLive(fragment)) return null;
+  const tombstone = { ...fragment, deletedAt: now, undoUntil: now + UNDO_WINDOW_MS };
+  try {
+    const tx = database.transaction("fragments", "readwrite");
+    tx.objectStore("fragments").put(tombstone);
+    await transactionDone(tx);
+  } catch {
+    announce("Fragment not deleted. Retry.");
+    return null;
+  }
+  state.fragments = state.fragments.map((candidate) => candidate.id === id ? tombstone : candidate);
+  render();
+  announce("Fragment deleted.");
+  return tombstone;
+}
+
+async function undoDelete(id, now) {
+  const fragment = state.fragments.find((candidate) => candidate.id === id);
+  if (!fragment || isLive(fragment) || !Number.isFinite(fragment.undoUntil) || fragment.undoUntil <= now) {
+    announce("Undo has expired.");
+    return null;
+  }
+  const { deletedAt, undoUntil, ...restored } = fragment;
+  try {
+    const tx = database.transaction("fragments", "readwrite");
+    tx.objectStore("fragments").put(restored);
+    await transactionDone(tx);
+  } catch {
+    announce("Fragment not restored. Retry Undo.");
+    return null;
+  }
+  state.fragments = state.fragments
+    .map((candidate) => candidate.id === id ? restored : candidate)
+    .sort((a, b) => b.createdAt - a.createdAt);
+  render();
+  announce("Fragment restored.");
+  return restored;
+}
+
 function flushDraft() {
   if (draftTimer !== null) {
     clearTimeout(draftTimer);
@@ -312,8 +379,16 @@ const entry = document.querySelector("#entry");
 const stream = document.querySelector("#stream");
 const counts = document.querySelector("#counts");
 const status = document.querySelector("#status");
+const undoToast = document.querySelector("#undoToast");
+const undoMessage = document.querySelector("#undoMessage");
+const undo = document.querySelector("#undo");
+const recentlyDeleted = document.querySelector("#recentlyDeleted");
+const deletedDialog = document.querySelector("#deletedDialog");
 let database;
 let draftTimer = null;
+let expiryTimer = null;
+let expiryCallback = null;
+let expiryDueAt = null;
 let draftFailureAnnounced = false;
 let inputRevision = 0;
 let captureQueue = Promise.resolve();
@@ -328,29 +403,114 @@ function resizeEntry() {
   entry.style.height = entry.scrollHeight + "px";
 }
 
+function renderDeletedDialog(tombstones) {
+  const title = document.createElement("h2");
+  title.id = "deletedTitle";
+  title.textContent = "Recently deleted";
+  const list = document.createElement("div");
+  for (const fragment of tombstones) {
+    const row = document.createElement("p");
+    const preview = document.createElement("span");
+    const compact = fragment.text.replace(/\s+/gu, " ");
+    preview.textContent = compact.length > 80 ? compact.slice(0, 77) + "…" : compact;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Undo";
+    button.dataset.undoId = fragment.id;
+    button.addEventListener("click", () => { void undoDelete(fragment.id, currentTime()); });
+    row.append(preview, " ", button);
+    list.append(row);
+  }
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "Close";
+  close.addEventListener("click", () => deletedDialog.close());
+  deletedDialog.replaceChildren(title, list, close);
+}
+
+async function expireDeleted() {
+  if (!database) return;
+  try {
+    const expiredIds = await purgeExpired(database, currentTime());
+    if (expiredIds.length) {
+      const expired = new Set(expiredIds);
+      state.fragments = state.fragments.filter((fragment) => !expired.has(fragment.id));
+    }
+    render();
+  } catch {
+    announce("Expired deletions could not be cleared.");
+  }
+}
+
+function scheduleExpiry(tombstones, now) {
+  if (expiryTimer !== null) clearTimeout(expiryTimer);
+  expiryTimer = null;
+  expiryCallback = null;
+  expiryDueAt = null;
+  if (!database || !tombstones.length) return;
+  const nearest = Math.min(...tombstones.map((fragment) => fragment.undoUntil));
+  const scheduled = () => {
+    if (expiryCallback !== scheduled) return Promise.resolve();
+    expiryTimer = null;
+    expiryCallback = null;
+    expiryDueAt = null;
+    return expireDeleted();
+  };
+  expiryCallback = scheduled;
+  expiryDueAt = nearest;
+  expiryTimer = setTimeout(() => { void scheduled(); }, Math.max(0, nearest - now));
+}
+
+function renderDeletionControls(tombstones, now) {
+  const newest = tombstones[0];
+  undoToast.hidden = !newest;
+  recentlyDeleted.hidden = !tombstones.length;
+  if (newest) {
+    undoMessage.textContent = "Fragment deleted.";
+    undo.dataset.undoId = newest.id;
+  } else {
+    undo.removeAttribute("data-undo-id");
+  }
+  if (deletedDialog.open) {
+    if (tombstones.length) renderDeletedDialog(tombstones);
+    else deletedDialog.close();
+  }
+  scheduleExpiry(tombstones, now);
+}
+
 function render() {
   stream.replaceChildren();
+  const now = currentTime();
   const visible = state.fragments.filter(isLive);
   for (const fragment of visible.slice(0, 100)) {
     const article = document.createElement("article");
     article.className = "frag";
+    article.dataset.fragmentId = fragment.id;
     const time = document.createElement("time");
     time.dateTime = new Date(fragment.createdAt).toISOString();
     time.textContent = new Date(fragment.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     const body = document.createElement("div");
     body.className = "body";
     body.textContent = fragment.text;
-    article.append(time, body);
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.className = "drop";
+    drop.textContent = "Delete";
+    drop.dataset.fragmentId = fragment.id;
+    drop.setAttribute("aria-label", "Delete fragment");
+    drop.addEventListener("click", () => { void deleteFragment(fragment.id, currentTime()); });
+    article.append(time, body, drop);
     stream.append(article);
   }
   counts.textContent = visible.length + (visible.length === 1 ? " fragment" : " fragments");
+  renderDeletionControls(unexpiredTombstones(state.fragments, now), now);
 }
 
 async function start() {
   const initialRevision = inputRevision;
   database = await openDatabase();
   await migrateLegacy(database);
-  const loaded = await loadState(database, Date.now());
+  const loaded = await loadState(database, currentTime());
   state = { fragments: loaded.fragments };
   restoreDraft(entry, loaded.draft, initialRevision, inputRevision);
   resizeEntry();
@@ -386,6 +546,17 @@ document.querySelector("#save").addEventListener("click", () => {
   void appendFragment(database, entry.value);
 });
 
+undo.addEventListener("click", () => {
+  if (undo.dataset.undoId) void undoDelete(undo.dataset.undoId, currentTime());
+});
+
+recentlyDeleted.addEventListener("click", () => {
+  const tombstones = unexpiredTombstones(state.fragments, currentTime());
+  if (!tombstones.length) return;
+  renderDeletedDialog(tombstones);
+  deletedDialog.showModal();
+});
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") void flushDraft();
 });
@@ -400,7 +571,22 @@ if (isTestMode(location)) {
   window.__ledgerTest = {
     ready,
     readAll,
+    setNow(value) {
+      if (!hasValidTimestamp(value)) throw new TypeError("now must be a non-negative finite number");
+      sessionStorage.setItem(TEST_NOW_KEY, String(value));
+    },
+    nextExpiryAt() {
+      return expiryDueAt;
+    },
+    fireExpiryTimer() {
+      if (!expiryCallback) throw new Error("no expiry timer scheduled");
+      if (expiryTimer !== null) clearTimeout(expiryTimer);
+      return expiryCallback();
+    },
     closeDatabase() {
+      if (expiryTimer !== null) clearTimeout(expiryTimer);
+      expiryCallback = null;
+      expiryDueAt = null;
       database?.close();
       database = undefined;
     },

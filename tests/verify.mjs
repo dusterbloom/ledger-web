@@ -61,6 +61,16 @@ test("fragment helpers preserve meaningful whitespace and classify tombstones", 
   assert.equal(isLive({ id: "a", createdAt: 1, text: "x", deletedAt: 10, undoUntil: 200 }), false);
 });
 
+test("only unexpired tombstones remain undoable", () => {
+  const { unexpiredTombstones } = extractTestableLogic(readApp(), ["unexpiredTombstones"]);
+  const rows = [
+    { id: "live", text: "x", createdAt: 1 },
+    { id: "old", text: "x", createdAt: 1, deletedAt: 2, undoUntil: 99 },
+    { id: "new", text: "x", createdAt: 1, deletedAt: 2, undoUntil: 101 },
+  ];
+  assert.deepEqual(unexpiredTombstones(rows, 100).map(row => row.id), ["new"]);
+});
+
 test("fragment IDs prefer UUIDs and fall back to timestamp plus random entropy", () => {
   const { makeId } = extractTestableLogic(readApp(), ["makeId"]);
   assert.equal(makeId(42, () => "uuid-preferred", () => 0.5), "uuid-preferred");
