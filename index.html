@@ -190,6 +190,185 @@ function unexpiredTombstones(fragments, now) {
     .sort((a, b) => b.deletedAt - a.deletedAt || b.createdAt - a.createdAt);
 }
 
+const BACKUP_FIELDS = ["id", "createdAt", "text", "source", "deletedAt", "undoUntil"];
+
+function makeBackup(fragments, now) {
+  return {
+    format: "ledger-web",
+    version: 1,
+    exportedAt: now,
+    fragments: (Array.isArray(fragments) ? fragments : [])
+      .filter((fragment) => !hasDeletedAt(fragment)
+        || (hasValidTimestamp(fragment.undoUntil) && fragment.undoUntil > now))
+      .map((fragment) => ({ ...fragment })),
+  };
+}
+
+function validImportedRecord(value, now, usedIds) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (Object.keys(value).some((key) => !BACKUP_FIELDS.includes(key))) return null;
+  if (!hasValidTimestamp(value.createdAt)) return null;
+  const text = normalizeText(value.text);
+  if (!text) return null;
+
+  let id;
+  if (Object.hasOwn(value, "id")) {
+    if (typeof value.id !== "string" || !value.id.trim()) return null;
+    id = value.id;
+  } else {
+    id = nextGeneratedId(usedIds, value.createdAt);
+  }
+  usedIds.add(id);
+
+  const fragment = { id, createdAt: value.createdAt, text };
+  if (Object.hasOwn(value, "source")) {
+    if (typeof value.source !== "string") return null;
+    fragment.source = value.source;
+  }
+
+  const hasDeleted = Object.hasOwn(value, "deletedAt");
+  const hasUndo = Object.hasOwn(value, "undoUntil");
+  if (hasDeleted !== hasUndo) return null;
+  if (hasDeleted) {
+    if (!hasValidTimestamp(value.deletedAt)
+      || !hasValidTimestamp(value.undoUntil)
+      || value.undoUntil <= now) return null;
+    fragment.deletedAt = value.deletedAt;
+    fragment.undoUntil = value.undoUntil;
+  }
+  return fragment;
+}
+
+function validateBackup(value, now) {
+  const topLevelFields = ["format", "version", "exportedAt", "fragments"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !topLevelFields.includes(key))
+    || value.format !== "ledger-web"
+    || value.version !== 1
+    || !hasValidTimestamp(value.exportedAt)
+    || !Array.isArray(value.fragments)
+    || !hasValidTimestamp(now)) {
+    return { valid: false, error: "This is not a supported Ledger backup." };
+  }
+
+  const usedIds = new Set(value.fragments
+    .filter((row) => row && typeof row === "object" && typeof row.id === "string")
+    .map((row) => row.id));
+  const fragments = [];
+  let invalid = 0;
+  for (const row of value.fragments) {
+    const fragment = validImportedRecord(row, now, usedIds);
+    if (fragment) fragments.push(fragment);
+    else invalid += 1;
+  }
+  return { valid: true, fragments, invalid };
+}
+
+function storedRecordSignature(record) {
+  return JSON.stringify(Object.keys(record).sort().map((key) => [key, record[key]]));
+}
+
+function planRestore(existing, incoming, now) {
+  const byId = new Map((Array.isArray(existing) ? existing : [])
+    .filter((record) => record && typeof record.id === "string")
+    .map((record) => [record.id, record]));
+  const usedIds = new Set(byId.keys());
+  for (const row of Array.isArray(incoming) ? incoming : []) {
+    if (row && typeof row === "object" && typeof row.id === "string") usedIds.add(row.id);
+  }
+  const plan = { add: [], duplicates: 0, invalid: 0, conflicts: 0 };
+  for (const value of Array.isArray(incoming) ? incoming : []) {
+    const fragment = validImportedRecord(value, now, usedIds);
+    if (!fragment) {
+      plan.invalid += 1;
+      continue;
+    }
+    const previous = byId.get(fragment.id);
+    if (!previous) {
+      plan.add.push(fragment);
+      byId.set(fragment.id, fragment);
+    } else if (storedRecordSignature(previous) === storedRecordSignature(fragment)) {
+      plan.duplicates += 1;
+    } else {
+      plan.conflicts += 1;
+    }
+  }
+  return plan;
+}
+
+async function restoreBackup(db, plan) {
+  const additions = Array.isArray(plan?.add) ? plan.add : [];
+  const tx = db.transaction("fragments", "readwrite");
+  const store = tx.objectStore("fragments");
+  for (const fragment of additions) store.add(fragment);
+  await transactionDone(tx);
+  return {
+    added: additions.length,
+    duplicates: Number.isFinite(plan?.duplicates) ? plan.duplicates : 0,
+    invalid: Number.isFinite(plan?.invalid) ? plan.invalid : 0,
+    conflicts: Number.isFinite(plan?.conflicts) ? plan.conflicts : 0,
+  };
+}
+
+function textImportRecords(text, filename, modifiedAt) {
+  const normalizedLines = typeof text === "string" ? text.replace(/\r\n?/gu, "\n") : "";
+  const blocks = normalizedLines.split(/\n[\t ]*\n+/u).map(normalizeText).filter(Boolean);
+  const start = hasValidTimestamp(modifiedAt) ? modifiedAt : Date.now();
+  const usedIds = new Set();
+  return blocks.map((block, index) => {
+    const createdAt = start + index;
+    const id = nextGeneratedId(usedIds, createdAt);
+    usedIds.add(id);
+    return { id, createdAt, text: block, source: "from " + filename };
+  });
+}
+
+function escapeMarkdown(value) {
+  return value.replace(/([\\`*_{}\[\]<>()#+\-.!|>])/gu, "\\$1");
+}
+
+function markdownArchive(fragments, locale) {
+  const dateFormat = new Intl.DateTimeFormat(locale, { dateStyle: "full" });
+  const timeFormat = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" });
+  const rows = (Array.isArray(fragments) ? fragments : [])
+    .filter((fragment) => !hasDeletedAt(fragment))
+    .slice()
+    .sort((a, b) => a.createdAt - b.createdAt || String(a.id).localeCompare(String(b.id)));
+  const lines = ["# Ledger", ""];
+  let previousDay = "";
+  for (const fragment of rows) {
+    const created = new Date(fragment.createdAt);
+    const day = created.getFullYear() + "-" + created.getMonth() + "-" + created.getDate();
+    if (day !== previousDay) {
+      if (previousDay) lines.push("");
+      previousDay = day;
+      lines.push("## " + dateFormat.format(created), "");
+    }
+    const textLines = fragment.text.replace(/\r\n?/gu, "\n").split("\n").map(escapeMarkdown);
+    lines.push("- " + timeFormat.format(created) + " — " + textLines[0]);
+    for (const line of textLines.slice(1)) lines.push("    " + line);
+    if (typeof fragment.source === "string" && fragment.source) {
+      lines.push("    Source: " + escapeMarkdown(fragment.source));
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+function downloadFile(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  let anchor;
+  try {
+    anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    document.body.append(anchor);
+    anchor.click();
+  } finally {
+    anchor?.remove();
+    URL.revokeObjectURL(url);
+  }
+}
+
 function openDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -425,6 +604,10 @@ const undoMessage = document.querySelector("#undoMessage");
 const undo = document.querySelector("#undo");
 const recentlyDeleted = document.querySelector("#recentlyDeleted");
 const deletedDialog = document.querySelector("#deletedDialog");
+const importButton = document.querySelector("#import");
+const exportJson = document.querySelector("#exportJson");
+const exportMarkdown = document.querySelector("#exportMarkdown");
+const fileInput = document.querySelector("#fileInput");
 let database;
 let draftTimer = null;
 let expiryTimer = null;
@@ -444,6 +627,31 @@ function announce(message) {
 function resizeEntry() {
   entry.style.height = "auto";
   entry.style.height = entry.scrollHeight + "px";
+}
+
+async function restoreRows(rows, now = currentTime(), invalid = 0) {
+  const plan = planRestore(state.fragments, rows, now);
+  plan.invalid += invalid;
+  const summary = await restoreBackup(database, plan);
+  state.fragments = state.fragments.concat(plan.add).sort(compareNewestFirst);
+  renderLimit = 100;
+  render();
+  return summary;
+}
+
+function importSummary(summary) {
+  return "Import complete: " + summary.added + " added, "
+    + summary.duplicates + " duplicate, "
+    + summary.invalid + " invalid, "
+    + summary.conflicts + " conflict.";
+}
+
+function datedFilename(extension, now) {
+  const date = new Date(now);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return "ledger-" + year + "-" + month + "-" + day + "." + extension;
 }
 
 function renderDeletedDialog(tombstones) {
@@ -669,6 +877,64 @@ recentlyDeleted.addEventListener("click", () => {
   deletedDialog.showModal();
 });
 
+importButton.addEventListener("click", () => fileInput.click());
+
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files?.[0];
+  try {
+    if (!file) return;
+    await ready;
+    const text = await file.text();
+    if (file.name.toLowerCase().endsWith(".json")) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        throw new Error("Choose a valid Ledger JSON backup.");
+      }
+      const validation = validateBackup(parsed, currentTime());
+      if (!validation.valid) throw new Error(validation.error);
+      announce(importSummary(await restoreRows(validation.fragments, currentTime(), validation.invalid)));
+    } else {
+      const modifiedAt = file.lastModified || Date.now();
+      const records = textImportRecords(text, file.name, modifiedAt);
+      announce(importSummary(await restoreRows(records, currentTime())));
+    }
+  } catch (error) {
+    const validationError = error instanceof Error
+      && (error.message === "Choose a valid Ledger JSON backup."
+        || error.message === "This is not a supported Ledger backup.");
+    announce(validationError
+      ? "Import failed. " + error.message
+      : "Import failed. No records were added; check available storage and retry.");
+  } finally {
+    fileInput.value = "";
+  }
+});
+
+exportJson.addEventListener("click", async () => {
+  try {
+    await ready;
+    const now = currentTime();
+    const backup = JSON.stringify(makeBackup(state.fragments, now), null, 2) + "\n";
+    downloadFile(datedFilename("json", now), backup, "application/json;charset=utf-8");
+    announce("Backup ready to download.");
+  } catch {
+    announce("Backup could not be prepared. Retry.");
+  }
+});
+
+exportMarkdown.addEventListener("click", async () => {
+  try {
+    await ready;
+    const now = currentTime();
+    downloadFile(datedFilename("md", now), markdownArchive(state.fragments), "text/markdown;charset=utf-8");
+    announce("Markdown archive ready to download.");
+  } catch {
+    announce("Markdown archive could not be prepared. Retry.");
+  }
+});
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") void flushDraft();
 });
@@ -709,6 +975,7 @@ if (isTestMode(location)) {
       renderLimit = 100;
       render();
     },
+    restoreRows,
     closeDatabase() {
       if (expiryTimer !== null) clearTimeout(expiryTimer);
       expiryCallback = null;

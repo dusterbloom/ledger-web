@@ -144,6 +144,157 @@ test("stored drafts restore only when startup observed no user input", () => {
   assert.equal(entry.value, "  stored exactly\n");
 });
 
+test("backup preserves stored fields and excludes only expired tombstones", () => {
+  const { makeBackup, validateBackup } = extractTestableLogic(readApp(), ["makeBackup", "validateBackup"]);
+  const live = { id: "live", createdAt: 1, text: "kept", source: "capture" };
+  const undoable = { id: "undoable", createdAt: 2, text: "pending", deletedAt: 3, undoUntil: 101 };
+  const expired = { id: "expired", createdAt: 4, text: "gone", deletedAt: 5, undoUntil: 100 };
+
+  const backup = makeBackup([expired, undoable, live], 100);
+  assert.deepEqual(backup, {
+    format: "ledger-web",
+    version: 1,
+    exportedAt: 100,
+    fragments: [undoable, live],
+  });
+  assert.deepEqual(validateBackup(backup, 100), {
+    valid: true, fragments: [undoable, live], invalid: 0,
+  });
+});
+
+test("backup validation rejects unsupported documents and skips invalid records", () => {
+  const { validateBackup } = extractTestableLogic(readApp(), ["validateBackup"]);
+  assert.equal(validateBackup({ format: "other", version: 1, fragments: [] }, 100).valid, false);
+
+  const result = validateBackup({
+    format: "ledger-web",
+    version: 1,
+    exportedAt: 50,
+    fragments: [
+      { id: "valid", createdAt: 1, text: "kept" },
+      { createdAt: 2, text: "generated id" },
+      { id: "empty", createdAt: 3, text: "  \n" },
+      { id: "expired", createdAt: 4, text: "gone", deletedAt: 5, undoUntil: 100 },
+      { id: "extra", createdAt: 6, text: "unknown", surprise: true },
+    ],
+  }, 100);
+
+  assert.equal(result.valid, true);
+  assert.equal(result.invalid, 3);
+  assert.deepEqual(result.fragments.map((row) => row.id === "valid" ? row : {
+    createdAt: row.createdAt, text: row.text,
+  }), [
+    { id: "valid", createdAt: 1, text: "kept" },
+    { createdAt: 2, text: "generated id" },
+  ]);
+  assert.equal(typeof result.fragments[1].id, "string");
+  assert.ok(result.fragments[1].id);
+});
+
+test("restore plan appends unique records without replacement", () => {
+  const { planRestore } = extractTestableLogic(readApp(), ["planRestore"]);
+  const existing = [{ id: "same", createdAt: 1, text: "original" }];
+  const incoming = [
+    { id: "same", createdAt: 1, text: "original" },
+    { id: "same", createdAt: 1, text: "changed" },
+    { id: "new", createdAt: 2, text: "added" },
+    { id: "bad", createdAt: -1, text: "invalid" },
+  ];
+  const plan = planRestore(existing, incoming, 100);
+  assert.deepEqual(plan.add.map((row) => row.id), ["new"]);
+  assert.equal(plan.duplicates, 1);
+  assert.equal(plan.conflicts, 1);
+  assert.equal(plan.invalid, 1);
+  assert.equal(plan.add.some((row) => row.id === "same"), false);
+});
+
+test("restore writes every addition with one add-only transaction", async () => {
+  const { restoreBackup } = extractTestableLogic(readApp(), ["restoreBackup"]);
+  const writes = [];
+  const tx = {
+    objectStore() {
+      return { add(row) { writes.push(row); } };
+    },
+  };
+  const db = {
+    transaction(store, mode) {
+      assert.equal(store, "fragments");
+      assert.equal(mode, "readwrite");
+      queueMicrotask(() => tx.oncomplete());
+      return tx;
+    },
+  };
+  const plan = {
+    add: [
+      { id: "one", createdAt: 1, text: "first" },
+      { id: "two", createdAt: 2, text: "second" },
+    ],
+    duplicates: 3,
+    invalid: 4,
+    conflicts: 5,
+  };
+
+  assert.deepEqual(await restoreBackup(db, plan), {
+    added: 2, duplicates: 3, invalid: 4, conflicts: 5,
+  });
+  assert.deepEqual(writes, plan.add);
+});
+
+test("text import preserves blocks and assigns ordered provenance", () => {
+  const { textImportRecords } = extractTestableLogic(readApp(), ["textImportRecords"]);
+  const rows = textImportRecords("  first line\r\nsecond  \r\n\r\n\r\n# heading\nbody\n", "notes.md", 40);
+  assert.deepEqual(rows.map(({ createdAt, text, source }) => ({ createdAt, text, source })), [
+    { createdAt: 40, text: "  first line\nsecond", source: "from notes.md" },
+    { createdAt: 41, text: "# heading\nbody", source: "from notes.md" },
+  ]);
+  assert.equal(rows.every((row) => typeof row.id === "string" && row.id), true);
+});
+
+test("Markdown archive is chronological and escapes fragment structure", () => {
+  const { markdownArchive } = extractTestableLogic(readApp(), ["markdownArchive"]);
+  const output = markdownArchive([
+    { id: "new", createdAt: 2000, text: "# newer\n- list\n* star [link]" },
+    { id: "deleted", createdAt: 1500, text: "hidden", deletedAt: 1600, undoUntil: 9999 },
+    { id: "old", createdAt: 1000, text: "# older" },
+  ], "en-US");
+
+  assert.ok(output.indexOf("\\# older") < output.indexOf("\\# newer"));
+  assert.ok(output.includes("\\# newer\n    \\- list\n    \\* star \\[link\\]"));
+  assert.doesNotMatch(output, /hidden/u);
+});
+
+test("downloads revoke their temporary object URL even when clicking fails", () => {
+  const { downloadFile } = extractTestableLogic(readApp(), ["downloadFile"]);
+  const originalDocument = globalThis.document;
+  const originalCreate = URL.createObjectURL;
+  const originalRevoke = URL.revokeObjectURL;
+  const calls = [];
+  const anchor = {
+    click() { calls.push("click"); throw new Error("blocked"); },
+    remove() { calls.push("remove"); },
+  };
+  globalThis.document = {
+    createElement(name) { assert.equal(name, "a"); return anchor; },
+    body: { append(node) { assert.equal(node, anchor); calls.push("append"); } },
+  };
+  URL.createObjectURL = () => "blob:test";
+  URL.revokeObjectURL = (url) => calls.push("revoke:" + url);
+  try {
+    assert.throws(() => downloadFile("ledger.json", "{}", "application/json"), /blocked/u);
+    assert.equal(anchor.href, "blob:test");
+    assert.equal(anchor.download, "ledger.json");
+    assert.deepEqual(calls, ["append", "click", "remove", "revoke:blob:test"]);
+    calls.length = 0;
+    globalThis.document.createElement = () => { throw new Error("no link"); };
+    assert.throws(() => downloadFile("ledger.json", "{}", "application/json"), /no link/u);
+    assert.deepEqual(calls, ["revoke:blob:test"]);
+  } finally {
+    globalThis.document = originalDocument;
+    URL.createObjectURL = originalCreate;
+    URL.revokeObjectURL = originalRevoke;
+  }
+});
+
 test("browser cleanup attempts every resource after an earlier failure", async () => {
   const { runCleanups } = extractRunnerLogic(["runCleanups"]);
   const calls = [];

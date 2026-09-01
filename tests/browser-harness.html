@@ -255,6 +255,42 @@ async function run() {
   assert(overlapState.fragments.some((fragment) => fragment.text === "overlap first"), "first overlap capture missing");
   assert(overlapState.fragments.some((fragment) => fragment.text === "overlap second"), "second overlap capture missing");
 
+  await frameWin().__ledgerTest.seedFragments([
+    { id: "restore-same", createdAt: 1, text: "original" },
+  ]);
+  const restoreSummary = await frameWin().__ledgerTest.restoreRows([
+    { id: "restore-same", createdAt: 1, text: "original" },
+    { id: "restore-same", createdAt: 1, text: "changed" },
+    { id: "restore-new", createdAt: 2, text: "added" },
+    { id: "restore-invalid", createdAt: -1, text: "invalid" },
+  ]);
+  assert(restoreSummary.added === 1, "restore did not append exactly one unique record");
+  assert(restoreSummary.duplicates === 1, "restore did not report its duplicate");
+  assert(restoreSummary.conflicts === 1, "restore did not report its conflict");
+  assert(restoreSummary.invalid === 1, "restore did not report its invalid record");
+  const restoredState = await frameWin().__ledgerTest.readAll();
+  assert(restoredState.fragments.find((row) => row.id === "restore-same")?.text === "original",
+    "restore conflict replaced existing text");
+  assert(restoredState.fragments.find((row) => row.id === "restore-new")?.text === "added",
+    "restore unique record was not committed");
+
+  const fileInput = frameDoc().querySelector("#fileInput");
+  const imported = new DataTransfer();
+  imported.items.add(new File(["first imported block\n\nsecond imported block"], "notes.txt", {
+    type: "text/plain", lastModified: 40,
+  }));
+  fileInput.files = imported.files;
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 4,
+    "text blocks were not imported in one selection");
+  assert(fileInput.value === "", "file input did not reset after import");
+  const textImportState = await frameWin().__ledgerTest.readAll();
+  const textRows = textImportState.fragments.filter((row) => row.source === "from notes.txt")
+    .sort((a, b) => a.createdAt - b.createdAt);
+  assert(textRows.length === 2, "text import did not preserve both non-empty blocks");
+  assert(textRows[0].createdAt === 40 && textRows[1].createdAt === 41,
+    "text import did not use stable millisecond offsets");
+
   const rows = Array.from({ length: 250 }, (_, index) => ({
     id: "batch-" + index,
     createdAt: index + 1,
