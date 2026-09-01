@@ -52,3 +52,24 @@ test("fragment helpers preserve meaningful whitespace and classify tombstones", 
   assert.equal(isLive({ id: "a", createdAt: 1, text: "x" }), true);
   assert.equal(isLive({ id: "a", createdAt: 1, text: "x", deletedAt: 10, undoUntil: 200 }), false);
 });
+
+test("fragment IDs prefer UUIDs and fall back to timestamp plus random entropy", () => {
+  const { makeId } = extractTestableLogic(readApp(), ["makeId"]);
+  assert.equal(makeId(42, () => "uuid-preferred", () => 0.5), "uuid-preferred");
+  assert.equal(makeId(42, () => "", () => 0.5), "16-zik0zk");
+});
+
+test("legacy records generate unique IDs for missing and duplicate IDs", () => {
+  const { normalizeLegacyRecord } = extractTestableLogic(readApp(), ["normalizeLegacyRecord"]);
+  const used = new Set(["legacy-id"]);
+  const missingId = normalizeLegacyRecord({ at: 7, text: "missing" }, used, 99);
+  const duplicateId = normalizeLegacyRecord({ id: "legacy-id", at: 8, text: "duplicate" }, used, 99);
+
+  assert.deepEqual({ createdAt: missingId.createdAt, text: missingId.text }, { createdAt: 7, text: "missing" });
+  assert.deepEqual({ createdAt: duplicateId.createdAt, text: duplicateId.text }, { createdAt: 8, text: "duplicate" });
+  assert.notEqual(missingId.id, "legacy-id");
+  assert.notEqual(duplicateId.id, "legacy-id");
+  assert.notEqual(duplicateId.id, missingId.id);
+  assert.ok(used.has(missingId.id));
+  assert.ok(used.has(duplicateId.id));
+});
