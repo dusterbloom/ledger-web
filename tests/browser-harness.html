@@ -34,7 +34,7 @@ const frameWin = () => frame.contentWindow;
 const frameDoc = () => frame.contentDocument;
 
 async function ready() {
-  await until(() => frameWin()?.__ledgerTest?.ready, "test interface missing");
+  await until(() => Boolean(frameWin()?.__ledgerTest), "test interface missing");
   await frameWin().__ledgerTest.ready;
 }
 
@@ -50,8 +50,10 @@ async function run() {
   await deleteDatabase("ledger-web");
   localStorage.clear();
   result.textContent = "loading application";
+  const loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
   frame.src = "../index.html?test=1";
   document.body.append(frame);
+  await loaded;
   await ready();
 
   result.textContent = "saving draft";
