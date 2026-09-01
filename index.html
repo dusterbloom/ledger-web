@@ -246,7 +246,15 @@ async function saveDraft(db, text) {
   }
 }
 
-async function appendFragment(db, text, source) {
+function appendFragment(db, text, source) {
+  const submittedRevision = inputRevision;
+  const capture = () => appendFragmentNow(db, text, source, submittedRevision);
+  const pending = captureQueue.then(capture, capture);
+  captureQueue = pending.then(() => undefined, () => undefined);
+  return pending;
+}
+
+async function appendFragmentNow(db, text, source, submittedRevision) {
   const submittedText = text;
   const normalized = normalizeText(text);
   if (!normalized) {
@@ -275,7 +283,7 @@ async function appendFragment(db, text, source) {
   }
 
   state.fragments.unshift(fragment);
-  const hasNewerText = entry.value !== submittedText;
+  const hasNewerText = inputRevision !== submittedRevision || entry.value !== submittedText;
   if (!hasNewerText) entry.value = "";
   resizeEntry();
   render();
@@ -308,6 +316,7 @@ let database;
 let draftTimer = null;
 let draftFailureAnnounced = false;
 let inputRevision = 0;
+let captureQueue = Promise.resolve();
 let state = { fragments: [] };
 
 function announce(message) {

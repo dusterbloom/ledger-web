@@ -91,6 +91,33 @@ async function reloadFrame() {
   await ready();
 }
 
+async function runFocusedOverlap() {
+  const releaseCaptures = await holdFragmentWrites();
+  const entry = frameDoc().querySelector("#entry");
+  entry.value = "overlap first";
+  entry.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "t" }));
+  entry.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  entry.value = "overlap second";
+  entry.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "d" }));
+  entry.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  await releaseCaptures();
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 2);
+  await wait(400);
+  await reloadFrame();
+  const state = await frameWin().__ledgerTest.readAll();
+  assert(frameDoc().querySelector("#entry").value === "", "committed overlap snapshot was restored as a draft");
+  assert(state.draft === "", "stale overlap draft survived both captures");
+  assert(state.fragments.some((fragment) => fragment.text === "overlap first"), "first overlap capture missing");
+  assert(state.fragments.some((fragment) => fragment.text === "overlap second"), "second overlap capture missing");
+  frameWin().__ledgerTest.closeDatabase();
+  document.body.dataset.status = "pass";
+  result.textContent = "overlapping captures left no stale draft";
+}
+
 async function run() {
   result.textContent = "deleting database";
   await deleteDatabase("ledger-web");
@@ -101,6 +128,10 @@ async function run() {
   document.body.append(frame);
   await loaded;
   await ready();
+  if (new URL(location.href).searchParams.get("focus") === "overlap") {
+    await runFocusedOverlap();
+    return;
+  }
 
   result.textContent = "saving draft";
   const entry = frameDoc().querySelector("#entry");
@@ -137,6 +168,27 @@ async function run() {
   const pendingState = await frameWin().__ledgerTest.readAll();
   assert(pendingState.fragments.some((fragment) => fragment.text === "submitted snapshot"), "submitted snapshot changed");
   assert(pendingState.draft === "typed during save", "newer composer text was not persisted");
+
+  const releaseOverlappingCaptures = await holdFragmentWrites();
+  pending.value = "overlap first";
+  pending.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "t" }));
+  pending.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  pending.value = "overlap second";
+  pending.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "d" }));
+  pending.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter", ctrlKey: true, bubbles: true, cancelable: true,
+  }));
+  await releaseOverlappingCaptures();
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 4);
+  await wait(400);
+  await reloadFrame();
+  assert(frameDoc().querySelector("#entry").value === "", "committed overlap snapshot was restored as a draft");
+  const overlapState = await frameWin().__ledgerTest.readAll();
+  assert(overlapState.draft === "", "stale overlap draft survived both captures");
+  assert(overlapState.fragments.some((fragment) => fragment.text === "overlap first"), "first overlap capture missing");
+  assert(overlapState.fragments.some((fragment) => fragment.text === "overlap second"), "second overlap capture missing");
 
   await seedFragments(101);
   await reloadFrame();

@@ -220,7 +220,9 @@ let cdp;
 try {
   const address = await listen(server);
   profile = await mkdtemp(resolve(tmpdir(), "ledger-browser-"));
-  const harnessUrl = `http://127.0.0.1:${address.port}/tests/browser-harness.html`;
+  const focus = process.env.LEDGER_BROWSER_FOCUS;
+  const query = focus ? `?focus=${encodeURIComponent(focus)}` : "";
+  const harnessUrl = `http://127.0.0.1:${address.port}/tests/browser-harness.html${query}`;
   browser = launchChromium([
     "--headless=new",
     "--disable-gpu",
@@ -233,7 +235,9 @@ try {
   const targetUrl = await findHarness(devtoolsUrl, harnessUrl, deadline);
   cdp = await connectCdp(targetUrl, deadline);
   await waitForHarness(cdp, deadline);
-  console.log("PASS: recovered drafts, preserved pending edits, and capped rendering");
+  console.log(focus === "overlap"
+    ? "PASS: overlapping captures left no stale draft"
+    : "PASS: recovered drafts, preserved pending edits, and capped rendering");
 } catch (error) {
   if (browser?.stderr()) error.message += "\n" + browser.stderr();
   throw error;
