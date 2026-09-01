@@ -67,6 +67,7 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 <header class="topbar">
   <h1>Ledger</h1>
   <div class="actions">
+    <button id="showLegacyData" type="button" hidden>Legacy data</button>
     <button id="import" type="button" disabled>Import</button>
     <button id="exportJson" type="button" disabled>Backup</button>
     <button id="exportMarkdown" type="button" disabled>Markdown</button>
@@ -78,6 +79,7 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
     <div class="recoveryActions">
       <button id="retryStartup" type="button">Retry</button>
       <button id="downloadLegacy" type="button" hidden>Download untouched legacy data</button>
+      <button id="dismissLegacy" type="button" hidden>Dismiss warning</button>
     </div>
   </section>
   <section id="compose" aria-labelledby="composeLabel">
@@ -107,11 +109,17 @@ const DB_NAME = "ledger-web";
 const DB_VERSION = 1;
 const LEGACY_KEY = "ledger.fragments";
 const UNDO_WINDOW_MS = 30000;
+const MAX_DATE_MS = 8_640_000_000_000_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const QUARANTINE_KEY = "quarantinedFragments";
+const BACKUP_FIELDS = ["id", "createdAt", "text", "source", "deletedAt", "undoUntil"];
 const TEST_NOW_KEY = "ledger.testNow";
 const TEST_STARTUP_FAILURE_KEY = "ledger.testStartupFailure";
+const TEST_MIGRATION_FAILURE_KEY = "ledger.testMigrationFailure";
+let lastPreparedDownload = null;
 
 function hasValidTimestamp(value) {
-  return Number.isFinite(value) && value >= 0;
+  return Number.isSafeInteger(value) && value >= 0 && value <= MAX_DATE_MS;
 }
 
 function describeStorageError(error, canExport = false) {
@@ -163,8 +171,8 @@ function nextGeneratedId(usedIds, now) {
 function normalizeLegacyRecord(value, usedIds, now) {
   if (!value || typeof value !== "object" || Array.isArray(value) || !(usedIds instanceof Set)) return null;
   const text = normalizeText(value.text);
-  const createdAt = hasValidTimestamp(value.at) ? value.at : (hasValidTimestamp(now) ? now : null);
-  if (!text || createdAt === null) return null;
+  if (!text || !hasValidTimestamp(value.at)) return null;
+  const createdAt = value.at;
 
   const hasUniqueId = typeof value.id === "string" && value.id.trim() && !usedIds.has(value.id);
   const id = hasUniqueId ? value.id : nextGeneratedId(usedIds, createdAt);
@@ -176,7 +184,41 @@ function normalizeLegacyRecord(value, usedIds, now) {
 }
 
 function isLive(fragment) {
-  return !Number.isFinite(fragment.deletedAt);
+  return !Object.hasOwn(fragment, "deletedAt");
+}
+
+function validStoredRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !BACKUP_FIELDS.includes(key))
+    || typeof value.id !== "string" || !value.id.trim()
+    || !hasValidTimestamp(value.createdAt)) return null;
+  const text = normalizeText(value.text);
+  if (!text) return null;
+
+  const fragment = { id: value.id, createdAt: value.createdAt, text };
+  if (Object.hasOwn(value, "source")) {
+    if (typeof value.source !== "string") return null;
+    fragment.source = value.source;
+  }
+
+  const hasDeleted = Object.hasOwn(value, "deletedAt");
+  const hasUndo = Object.hasOwn(value, "undoUntil");
+  if (hasDeleted !== hasUndo) return null;
+  if (hasDeleted) {
+    if (!hasValidTimestamp(value.deletedAt)
+      || !hasValidTimestamp(value.undoUntil)
+      || value.deletedAt < value.createdAt
+      || value.undoUntil <= value.deletedAt
+      || value.undoUntil - value.deletedAt > UNDO_WINDOW_MS) return null;
+    fragment.deletedAt = value.deletedAt;
+    fragment.undoUntil = value.undoUntil;
+  }
+  return fragment;
+}
+
+function boundedExpiryDelay(deadline, now) {
+  if (!hasValidTimestamp(deadline) || !hasValidTimestamp(now)) return 0;
+  return Math.min(MAX_TIMER_DELAY_MS, Math.max(0, deadline - now));
 }
 
 function queryTokens(query) {
@@ -208,7 +250,8 @@ function compareNewestFirst(a, b) {
 function searchFragments(fragments, query, now) {
   const tokens = queryTokens(query);
   return (Array.isArray(fragments) ? fragments : [])
-    .filter((fragment) => !hasDeletedAt(fragment) && matchesFragment(fragment, tokens))
+    .map(validStoredRecord)
+    .filter((fragment) => fragment && !hasDeletedAt(fragment) && matchesFragment(fragment, tokens))
     .sort(compareNewestFirst);
 }
 
@@ -217,23 +260,22 @@ function visibleSlice(results, count = 100) {
 }
 
 function unexpiredTombstones(fragments, now) {
-  return fragments
-    .filter((fragment) => Number.isFinite(fragment.deletedAt)
-      && Number.isFinite(fragment.undoUntil)
+  return (Array.isArray(fragments) ? fragments : [])
+    .map(validStoredRecord)
+    .filter((fragment) => fragment && hasDeletedAt(fragment)
       && fragment.undoUntil > now)
     .sort((a, b) => b.deletedAt - a.deletedAt || b.createdAt - a.createdAt);
 }
 
-const BACKUP_FIELDS = ["id", "createdAt", "text", "source", "deletedAt", "undoUntil"];
-
 function makeBackup(fragments, now) {
+  if (!hasValidTimestamp(now)) throw new TypeError("backup time is invalid");
   return {
     format: "ledger-web",
     version: 1,
     exportedAt: now,
     fragments: (Array.isArray(fragments) ? fragments : [])
-      .filter((fragment) => !hasDeletedAt(fragment)
-        || (hasValidTimestamp(fragment.undoUntil) && fragment.undoUntil > now))
+      .map(validStoredRecord)
+      .filter((fragment) => fragment && (!hasDeletedAt(fragment) || fragment.undoUntil > now))
       .map((fragment) => ({ ...fragment })),
   };
 }
@@ -260,17 +302,12 @@ function validImportedRecord(value, now, usedIds) {
     fragment.source = value.source;
   }
 
-  const hasDeleted = Object.hasOwn(value, "deletedAt");
-  const hasUndo = Object.hasOwn(value, "undoUntil");
-  if (hasDeleted !== hasUndo) return null;
-  if (hasDeleted) {
-    if (!hasValidTimestamp(value.deletedAt)
-      || !hasValidTimestamp(value.undoUntil)
-      || value.undoUntil <= now) return null;
-    fragment.deletedAt = value.deletedAt;
-    fragment.undoUntil = value.undoUntil;
-  }
-  return fragment;
+  if (Object.hasOwn(value, "deletedAt")) fragment.deletedAt = value.deletedAt;
+  if (Object.hasOwn(value, "undoUntil")) fragment.undoUntil = value.undoUntil;
+  const validated = validStoredRecord(fragment);
+  if (!validated || (hasDeletedAt(validated) && validated.undoUntil <= now)) return null;
+  usedIds.add(validated.id);
+  return validated;
 }
 
 function validateBackup(value, now) {
@@ -347,8 +384,8 @@ async function restoreBackup(db, plan) {
 function textImportRecords(text, filename, modifiedAt) {
   const normalizedLines = typeof text === "string" ? text.replace(/\r\n?/gu, "\n") : "";
   const blocks = normalizedLines.split(/\n[\t ]*\n+/u).map(normalizeText).filter(Boolean);
-  const latestStart = Number.MAX_SAFE_INTEGER - Math.max(0, blocks.length - 1);
-  const requestedStart = hasValidTimestamp(modifiedAt) ? Math.floor(modifiedAt) : Date.now();
+  const latestStart = MAX_DATE_MS - Math.max(0, blocks.length - 1);
+  const requestedStart = hasValidTimestamp(modifiedAt) ? modifiedAt : Date.now();
   const start = Math.min(requestedStart, latestStart);
   const usedIds = new Set();
   return blocks.map((block, index) => {
@@ -367,7 +404,8 @@ function markdownArchive(fragments, locale) {
   const dateFormat = new Intl.DateTimeFormat(locale, { dateStyle: "full" });
   const timeFormat = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" });
   const rows = (Array.isArray(fragments) ? fragments : [])
-    .filter((fragment) => !hasDeletedAt(fragment))
+    .map(validStoredRecord)
+    .filter((fragment) => fragment && !hasDeletedAt(fragment))
     .slice()
     .sort((a, b) => a.createdAt - b.createdAt || String(a.id).localeCompare(String(b.id)));
   const lines = ["# Ledger", ""];
@@ -392,7 +430,53 @@ function markdownArchive(fragments, locale) {
   return lines.join("\n") + "\n";
 }
 
+function highlightRanges(value, tokens) {
+  const text = typeof value === "string" ? value : "";
+  const lowercase = text.toLowerCase();
+  const indexMap = [];
+  let originalIndex = 0;
+  for (const character of text) {
+    const folded = character.toLowerCase();
+    const originalEnd = originalIndex + character.length;
+    for (let index = 0; index < folded.length; index += 1) {
+      indexMap.push([originalIndex, originalEnd]);
+    }
+    originalIndex = originalEnd;
+  }
+  if (indexMap.length !== lowercase.length) return [];
+
+  const ranges = [];
+  for (const token of Array.isArray(tokens) ? tokens : []) {
+    if (!token) continue;
+    let start = lowercase.indexOf(token);
+    while (start !== -1) {
+      const finalMap = indexMap[start + token.length - 1];
+      if (indexMap[start] && finalMap) ranges.push([indexMap[start][0], finalMap[1]]);
+      start = lowercase.indexOf(token, start + 1);
+    }
+  }
+  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged = [];
+  for (const range of ranges) {
+    const previous = merged[merged.length - 1];
+    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1]);
+    else merged.push(range);
+  }
+  return merged;
+}
+
+function resultCountLabel(shown, total, searching) {
+  if (searching) {
+    if (shown < total) return shown + " of " + total + " matches";
+    return total + (total === 1 ? " match" : " matches");
+  }
+  return shown + " of " + total + (total === 1 ? " fragment" : " fragments");
+}
+
 function downloadFile(name, text, type) {
+  if (typeof location !== "undefined" && isTestMode(location)) {
+    lastPreparedDownload = { name, text, type };
+  }
   const url = URL.createObjectURL(new Blob([text], { type }));
   let anchor;
   try {
@@ -461,51 +545,114 @@ function transactionDone(tx) {
 }
 
 async function purgeExpired(db, now) {
+  if (!hasValidTimestamp(now)) throw new TypeError("purge time is invalid");
   const tx = db.transaction("fragments", "readwrite");
   const store = tx.objectStore("fragments");
   const fragments = await requestResult(store.getAll());
   const expiredIds = fragments
-    .filter((fragment) => !isLive(fragment)
-      && Number.isFinite(fragment.undoUntil)
-      && fragment.undoUntil <= now)
+    .map(validStoredRecord)
+    .filter((fragment) => fragment && !isLive(fragment) && fragment.undoUntil <= now)
     .map((fragment) => fragment.id);
   for (const id of expiredIds) store.delete(id);
   await transactionDone(tx);
   return expiredIds;
 }
 
-async function migrateLegacy(db) {
-  const readTx = db.transaction("meta", "readonly");
-  const marker = await requestResult(readTx.objectStore("meta").get("localStorageMigration"));
-  await transactionDone(readTx);
-  if (marker) return { status: "already-migrated" };
+async function migrateLegacy(db, legacyStorage) {
+  const writeTx = db.transaction(["fragments", "meta"], "readwrite");
+  const done = transactionDone(writeTx);
+  const fragmentStore = writeTx.objectStore("fragments");
+  const metaStore = writeTx.objectStore("meta");
+  const marker = await requestResult(metaStore.get("localStorageMigration"));
+  if (marker) {
+    await done;
+    return { status: "already-migrated" };
+  }
 
-  const raw = localStorage.getItem(LEGACY_KEY);
+  let storage;
+  let raw;
+  try {
+    storage = legacyStorage === undefined ? globalThis.localStorage : legacyStorage;
+    raw = storage.getItem(LEGACY_KEY);
+  } catch {
+    await done;
+    return { status: "storage-unavailable" };
+  }
   let legacy = [];
+  let malformed = false;
   if (raw !== null) {
     try {
       legacy = JSON.parse(raw);
     } catch {
-      return { status: "malformed", raw };
+      malformed = true;
     }
-    if (!Array.isArray(legacy)) return { status: "malformed", raw };
+    if (!Array.isArray(legacy)) malformed = true;
   }
 
-  const usedIds = new Set();
   const now = Date.now();
-  const fragments = legacy.map((value) => normalizeLegacyRecord(value, usedIds, now)).filter(Boolean);
-  const writeTx = db.transaction(["fragments", "meta"], "readwrite");
-  const fragmentStore = writeTx.objectStore("fragments");
-  for (const fragment of fragments) fragmentStore.put(fragment);
-  writeTx.objectStore("meta").put({ key: "localStorageMigration", value: true });
-  await transactionDone(writeTx);
-  localStorage.removeItem(LEGACY_KEY);
-  return { status: "migrated", count: fragments.length };
+  if (malformed) {
+    await done;
+    return { status: "malformed", raw };
+  }
+
+  const usedIds = new Set(await requestResult(fragmentStore.getAllKeys()));
+  const fragments = [];
+  let invalid = 0;
+  for (const value of legacy) {
+    const fragment = normalizeLegacyRecord(value, usedIds, now);
+    if (fragment) fragments.push(fragment);
+    else invalid += 1;
+  }
+  for (const fragment of fragments) fragmentStore.add(fragment);
+  metaStore.put({ key: "localStorageMigration", value: { count: fragments.length, invalid } });
+  if (takeTestMigrationFailure("abort")) writeTx.abort();
+  await done;
+  if (raw !== null) {
+    try {
+      if (storage.getItem(LEGACY_KEY) === raw) storage.removeItem(LEGACY_KEY);
+    } catch {
+      // The durable marker makes a completed migration idempotent even if cleanup is restricted.
+    }
+  }
+  return { status: "migrated", count: fragments.length, invalid };
 }
 
 async function loadState(db, now) {
-  await purgeExpired(db, now);
-  return readStateSnapshot(db);
+  if (!hasValidTimestamp(now)) throw new TypeError("startup time is invalid");
+  const tx = db.transaction(["fragments", "meta"], "readwrite");
+  const done = transactionDone(tx);
+  const fragmentStore = tx.objectStore("fragments");
+  const metaStore = tx.objectStore("meta");
+  const [storedFragments, storedKeys, draftRecord, quarantineRecord] = await Promise.all([
+    requestResult(fragmentStore.getAll()),
+    requestResult(fragmentStore.getAllKeys()),
+    requestResult(metaStore.get("draft")),
+    requestResult(metaStore.get(QUARANTINE_KEY)),
+  ]);
+  const fragments = [];
+  const quarantined = [];
+  storedFragments.forEach((row, index) => {
+    const fragment = validStoredRecord(row);
+    if (!fragment) {
+      quarantined.push(row);
+      fragmentStore.delete(storedKeys[index]);
+    } else if (hasDeletedAt(fragment) && fragment.undoUntil <= now) {
+      fragmentStore.delete(storedKeys[index]);
+    } else {
+      fragments.push(fragment);
+    }
+  });
+  if (quarantined.length) {
+    const previous = Array.isArray(quarantineRecord?.value) ? quarantineRecord.value : [];
+    metaStore.put({ key: QUARANTINE_KEY, value: previous.concat(quarantined) });
+  }
+  await done;
+  fragments.sort(compareNewestFirst);
+  return {
+    fragments,
+    draft: typeof draftRecord?.value === "string" ? draftRecord.value : "",
+    quarantined: quarantined.length,
+  };
 }
 
 async function readStateSnapshot(db) {
@@ -515,8 +662,12 @@ async function readStateSnapshot(db) {
     requestResult(tx.objectStore("meta").get("draft")),
   ]);
   await transactionDone(tx);
-  storedFragments.sort((a, b) => b.createdAt - a.createdAt);
-  return { fragments: storedFragments, draft: typeof draftRecord?.value === "string" ? draftRecord.value : "" };
+  const fragments = storedFragments.map(validStoredRecord).filter(Boolean).sort(compareNewestFirst);
+  return {
+    fragments,
+    draft: typeof draftRecord?.value === "string" ? draftRecord.value : "",
+    invalid: storedFragments.length - fragments.length,
+  };
 }
 
 function isTestMode(currentLocation) {
@@ -528,6 +679,12 @@ function isTestMode(currentLocation) {
 function takeTestStartupFailure(kind) {
   if (!isTestMode(location) || sessionStorage.getItem(TEST_STARTUP_FAILURE_KEY) !== kind) return false;
   sessionStorage.removeItem(TEST_STARTUP_FAILURE_KEY);
+  return true;
+}
+
+function takeTestMigrationFailure(kind) {
+  if (!isTestMode(location) || sessionStorage.getItem(TEST_MIGRATION_FAILURE_KEY) !== kind) return false;
+  sessionStorage.removeItem(TEST_MIGRATION_FAILURE_KEY);
   return true;
 }
 
@@ -611,6 +768,10 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
 
   const usedIds = new Set(state.fragments.map((fragment) => fragment.id));
   const createdAt = Date.now();
+  if (!hasValidTimestamp(createdAt)) {
+    announce("Fragment not saved. The system clock is outside the supported date range.");
+    return null;
+  }
   const fragment = { id: nextGeneratedId(usedIds, createdAt), createdAt, text: normalized };
   if (typeof source === "string" && source) fragment.source = source;
 
@@ -652,7 +813,8 @@ async function deleteFragment(id, now) {
     return null;
   }
   const fragment = state.fragments.find((candidate) => candidate.id === id);
-  if (!fragment || !isLive(fragment)) return null;
+  if (!fragment || !isLive(fragment) || !hasValidTimestamp(now)
+    || now < fragment.createdAt || now > MAX_DATE_MS - UNDO_WINDOW_MS) return null;
   const tombstone = { ...fragment, deletedAt: now, undoUntil: now + UNDO_WINDOW_MS };
   try {
     const tx = database.transaction("fragments", "readwrite");
@@ -675,8 +837,8 @@ async function undoDelete(id, now) {
     announce("Fragment not restored. Retry Undo.");
     return null;
   }
-  const fragment = state.fragments.find((candidate) => candidate.id === id);
-  if (!fragment || isLive(fragment) || !Number.isFinite(fragment.undoUntil) || fragment.undoUntil <= now) {
+  const fragment = validStoredRecord(state.fragments.find((candidate) => candidate.id === id));
+  if (!fragment || isLive(fragment) || !hasValidTimestamp(now) || fragment.undoUntil <= now) {
     announce("Undo has expired.");
     return null;
   }
@@ -734,6 +896,8 @@ const recovery = document.querySelector("#recovery");
 const recoveryMessage = document.querySelector("#recoveryMessage");
 const retryStartupButton = document.querySelector("#retryStartup");
 const downloadLegacy = document.querySelector("#downloadLegacy");
+const dismissLegacy = document.querySelector("#dismissLegacy");
+const showLegacyData = document.querySelector("#showLegacyData");
 const importButton = document.querySelector("#import");
 const exportJson = document.querySelector("#exportJson");
 const exportMarkdown = document.querySelector("#exportMarkdown");
@@ -743,6 +907,7 @@ let draftTimer = null;
 let expiryTimer = null;
 let expiryCallback = null;
 let expiryDueAt = null;
+let expiryDelay = null;
 let shouldFailNextExpiryPurge = false;
 let shouldFailNextCaptureTransaction = false;
 let draftFailuresRemaining = 0;
@@ -752,6 +917,7 @@ let legacyRecoveryRaw = null;
 let importReturnPending = false;
 let persistenceWritable = false;
 let hasVerifiedReadableSnapshot = false;
+let failNextExportRead = false;
 let inputRevision = 0;
 let captureQueue = Promise.resolve();
 let state = { fragments: [] };
@@ -773,6 +939,8 @@ function setRecoveryState(kind, details) {
   recovery.hidden = kind === "ready" || kind === "loading";
   retryStartupButton.hidden = kind === "ready" || kind === "loading";
   downloadLegacy.hidden = kind !== "malformed";
+  dismissLegacy.hidden = kind !== "malformed";
+  showLegacyData.hidden = true;
   legacyRecoveryRaw = kind === "malformed" && typeof details === "string" ? details : null;
   if (kind === "ready" || kind === "loading") {
     recoveryMessage.textContent = "";
@@ -816,25 +984,52 @@ function datedFilename(extension, now) {
   return "ledger-" + year + "-" + month + "-" + day + "." + extension;
 }
 
+async function exportSnapshot() {
+  let readError;
+  if (database) {
+    try {
+      if (failNextExportRead) {
+        failNextExportRead = false;
+        throw new DOMException("test export read failure", "InvalidStateError");
+      }
+      const snapshot = await readStateSnapshot(database);
+      return { fragments: snapshot.fragments, invalid: snapshot.invalid, mode: "storage" };
+    } catch (error) {
+      readError = error;
+    }
+  } else {
+    readError = new DOMException("storage is unreadable", "InvalidStateError");
+  }
+  if (!hasVerifiedReadableSnapshot) throw readError;
+  return {
+    fragments: state.fragments.map(validStoredRecord).filter(Boolean),
+    invalid: 0,
+    mode: "session",
+  };
+}
+
 function renderDeletedDialog(tombstones) {
   const title = document.createElement("h2");
   title.id = "deletedTitle";
   title.textContent = "Recently deleted";
   const list = document.createElement("div");
-  for (const fragment of tombstones) {
+  tombstones.forEach((fragment, index) => {
     const row = document.createElement("p");
     const preview = document.createElement("span");
+    preview.id = "deletedPreview" + index;
     const compact = fragment.text.replace(/\s+/gu, " ");
     preview.textContent = compact.length > 80 ? compact.slice(0, 77) + "…" : compact;
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = "Undo";
+    button.setAttribute("aria-label", "Undo deletion " + (index + 1) + " of " + tombstones.length);
+    button.setAttribute("aria-describedby", preview.id);
     button.disabled = !persistenceWritable;
     button.dataset.undoId = fragment.id;
     button.addEventListener("click", () => { void undoDelete(fragment.id, currentTime()); });
     row.append(preview, " ", button);
     list.append(row);
-  }
+  });
   const close = document.createElement("button");
   close.type = "button";
   close.textContent = "Close";
@@ -870,6 +1065,7 @@ function scheduleExpiry(tombstones, now) {
   expiryTimer = null;
   expiryCallback = null;
   expiryDueAt = null;
+  expiryDelay = null;
   if (!database || !tombstones.length) return;
   const nearest = Math.min(...tombstones.map((fragment) => fragment.undoUntil));
   const scheduled = () => {
@@ -881,7 +1077,8 @@ function scheduleExpiry(tombstones, now) {
   };
   expiryCallback = scheduled;
   expiryDueAt = nearest;
-  expiryTimer = setTimeout(() => { void scheduled(); }, Math.max(0, nearest - now));
+  expiryDelay = boundedExpiryDelay(nearest, now);
+  expiryTimer = setTimeout(() => { void scheduled(); }, expiryDelay);
 }
 
 function renderDeletionControls(tombstones, now) {
@@ -909,22 +1106,7 @@ function appendHighlightedText(parent, value, tokens) {
     parent.append(document.createTextNode(text));
     return;
   }
-  const lowercase = text.toLowerCase();
-  const ranges = [];
-  for (const token of tokens) {
-    let start = lowercase.indexOf(token);
-    while (start !== -1) {
-      ranges.push([start, start + token.length]);
-      start = lowercase.indexOf(token, start + 1);
-    }
-  }
-  ranges.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
-  const merged = [];
-  for (const range of ranges) {
-    const previous = merged[merged.length - 1];
-    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1]);
-    else merged.push(range);
-  }
+  const merged = highlightRanges(text, tokens);
   let cursor = 0;
   for (const [start, end] of merged) {
     if (cursor < start) parent.append(document.createTextNode(text.slice(cursor, start)));
@@ -979,9 +1161,7 @@ function render() {
     article.append(time, body, drop);
     stream.append(article);
   }
-  counts.textContent = tokens.length
-    ? results.length + (results.length === 1 ? " match" : " matches")
-    : visible.length + " of " + results.length + (results.length === 1 ? " fragment" : " fragments");
+  counts.textContent = resultCountLabel(visible.length, results.length, tokens.length > 0);
   loadMore.hidden = visible.length >= results.length;
   renderDeletionControls(unexpiredTombstones(state.fragments, now), now);
 }
@@ -1024,6 +1204,10 @@ async function start() {
   restoreDraft(entry, loaded.draft, initialRevision, inputRevision);
   resizeEntry();
   setRecoveryState(migration.status === "malformed" ? "malformed" : "ready", migration.raw);
+  if (loaded.quarantined) {
+    announce(loaded.quarantined + " invalid stored fragment"
+      + (loaded.quarantined === 1 ? "" : "s") + " quarantined; valid data remains available.");
+  }
   if (shouldAutofocusComposer(matchMedia("(pointer: fine)").matches, document.activeElement === document.body)) {
     entry.focus();
   }
@@ -1180,13 +1364,38 @@ downloadLegacy.addEventListener("click", () => {
   downloadFile("ledger-legacy-untouched.txt", legacyRecoveryRaw, "text/plain;charset=utf-8");
 });
 
+dismissLegacy.addEventListener("click", () => {
+  if (legacyRecoveryRaw === null) return;
+  const warning = "Dismiss this warning? The legacy data was not imported. "
+    + "It will stay untouched and can be reopened for download.";
+  if (!confirm(warning)) return;
+  recovery.hidden = true;
+  showLegacyData.hidden = false;
+  showLegacyData.focus();
+});
+
+showLegacyData.addEventListener("click", () => {
+  if (legacyRecoveryRaw === null) return;
+  recovery.hidden = false;
+  showLegacyData.hidden = true;
+  downloadLegacy.focus();
+});
+
 exportJson.addEventListener("click", async () => {
   try {
     await ready;
+    const snapshot = await exportSnapshot();
     const now = currentTime();
-    const backup = JSON.stringify(makeBackup(state.fragments, now), null, 2) + "\n";
+    const backup = JSON.stringify(makeBackup(snapshot.fragments, now), null, 2) + "\n";
     downloadFile(datedFilename("json", now), backup, "application/json;charset=utf-8");
-    announce("Backup ready to download.");
+    if (snapshot.mode === "session") {
+      announce("Backup ready from this tab's session snapshot because storage could not be read.");
+    } else if (snapshot.invalid) {
+      announce("Backup ready to download; " + snapshot.invalid + " invalid stored fragment"
+        + (snapshot.invalid === 1 ? " was" : "s were") + " omitted.");
+    } else {
+      announce("Backup ready to download.");
+    }
   } catch {
     announce("Backup could not be prepared. Retry.");
   }
@@ -1195,9 +1404,17 @@ exportJson.addEventListener("click", async () => {
 exportMarkdown.addEventListener("click", async () => {
   try {
     await ready;
+    const snapshot = await exportSnapshot();
     const now = currentTime();
-    downloadFile(datedFilename("md", now), markdownArchive(state.fragments), "text/markdown;charset=utf-8");
-    announce("Markdown archive ready to download.");
+    downloadFile(datedFilename("md", now), markdownArchive(snapshot.fragments), "text/markdown;charset=utf-8");
+    if (snapshot.mode === "session") {
+      announce("Markdown ready from this tab's session snapshot because storage could not be read.");
+    } else if (snapshot.invalid) {
+      announce("Markdown archive ready; " + snapshot.invalid + " invalid stored fragment"
+        + (snapshot.invalid === 1 ? " was" : "s were") + " omitted.");
+    } else {
+      announce("Markdown archive ready to download.");
+    }
   } catch {
     announce("Markdown archive could not be prepared. Retry.");
   }
@@ -1213,11 +1430,14 @@ if (isTestMode(location)) {
     ready,
     readAll,
     setNow(value) {
-      if (!hasValidTimestamp(value)) throw new TypeError("now must be a non-negative finite number");
+      if (!hasValidTimestamp(value)) throw new TypeError("now must be a safe integer in the Date range");
       sessionStorage.setItem(TEST_NOW_KEY, String(value));
     },
     nextExpiryAt() {
       return expiryDueAt;
+    },
+    nextExpiryDelay() {
+      return expiryDelay;
     },
     fireExpiryTimer() {
       if (!expiryCallback) throw new Error("no expiry timer scheduled");
@@ -1236,6 +1456,13 @@ if (isTestMode(location)) {
     },
     draftFailureAnnouncements() {
       return draftFailureAnnouncementCount;
+    },
+    lastDownload() {
+      return lastPreparedDownload && { ...lastPreparedDownload };
+    },
+    failNextExportRead() {
+      failNextExportRead = true;
+      lastPreparedDownload = null;
     },
     saveDraftDirect(text) {
       return saveDraft(database, text);
@@ -1278,6 +1505,7 @@ if (isTestMode(location)) {
       if (expiryTimer !== null) clearTimeout(expiryTimer);
       expiryCallback = null;
       expiryDueAt = null;
+      expiryDelay = null;
       database?.close();
       database = undefined;
     },
@@ -1316,7 +1544,9 @@ the MIT License. The complete MIT license text is in [LICENSE](LICENSE).
 Ledger bundles the following typefaces, each released under the SIL Open Font
 License, Version 1.1:
 
+- Atkinson Hyperlegible — Copyright 2020 Braille Institute of America, Inc.
 - Literata — Copyright 2017 The Literata Project Authors.
+- Newsreader — Copyright 2020 The Newsreader Project Authors.
 - Work Sans — Copyright 2019 The Work Sans Project Authors.
 
 The complete font license texts are in
@@ -1417,6 +1647,193 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 
 Copyright 2019 The Work Sans Project Authors (https://github.com/weiweihuanghuang/Work-Sans)
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded,
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+Software shall not be used to promote, endorse or advertise any
+Modified Version, except to acknowledge the contribution(s) of the
+Copyright Holder(s) and the Author(s) or with their explicit written
+permission.
+
+5) The Font Software, modified or unmodified, in part or in whole,
+must be distributed entirely under this license, and must not be
+distributed under any other license. The requirement for fonts to
+remain under this license does not apply to any document created
+using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are
+not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+OTHER DEALINGS IN THE FONT SOFTWARE.
+
+Copyright 2020 Braille Institute of America, Inc.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is copied below, and is also available with a FAQ at:
+http://scripts.sil.org/OFL
+
+-----------------------------------------------------------
+SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+-----------------------------------------------------------
+
+PREAMBLE
+The goals of the Open Font License (OFL) are to stimulate worldwide
+development of collaborative font projects, to support the font creation
+efforts of academic and linguistic communities, and to provide a free and
+open framework in which fonts may be shared and improved in partnership
+with others.
+
+The OFL allows the licensed fonts to be used, studied, modified and
+redistributed freely as long as they are not sold by themselves. The
+fonts, including any derivative works, can be bundled, embedded,
+redistributed and/or sold with any software provided that any reserved
+names are not used by derivative works. The fonts and derivatives,
+however, cannot be released under any other type of license. The
+requirement for fonts to remain under this license does not apply
+to any document created using the fonts or their derivatives.
+
+DEFINITIONS
+"Font Software" refers to the set of files released by the Copyright
+Holder(s) under this license and clearly marked as such. This may
+include source files, build scripts and documentation.
+
+"Reserved Font Name" refers to any names specified as such after the
+copyright statement(s).
+
+"Original Version" refers to the collection of Font Software components as
+distributed by the Copyright Holder(s).
+
+"Modified Version" refers to any derivative made by adding to, deleting,
+or substituting -- in part or in whole -- any of the components of the
+Original Version, by changing formats or by porting the Font Software to a
+new environment.
+
+"Author" refers to any designer, engineer, programmer, technical
+writer or other person who contributed to the Font Software.
+
+PERMISSION & CONDITIONS
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Font Software, to use, study, copy, merge, embed, modify,
+redistribute, and sell modified and unmodified copies of the Font
+Software, subject to the following conditions:
+
+1) Neither the Font Software nor any of its individual components,
+in Original or Modified Versions, may be sold by itself.
+
+2) Original or Modified Versions of the Font Software may be bundled,
+redistributed and/or sold with any software, provided that each copy
+contains the above copyright notice and this license. These can be
+included either as stand-alone text files, human-readable headers or
+in the appropriate machine-readable metadata fields within text or
+binary files as long as those fields can be easily viewed by the user.
+
+3) No Modified Version of the Font Software may use the Reserved Font
+Name(s) unless explicit written permission is granted by the corresponding
+Copyright Holder. This restriction only applies to the primary font name as
+presented to the users.
+
+4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+Software shall not be used to promote, endorse or advertise any
+Modified Version, except to acknowledge the contribution(s) of the
+Copyright Holder(s) and the Author(s) or with their explicit written
+permission.
+
+5) The Font Software, modified or unmodified, in part or in whole,
+must be distributed entirely under this license, and must not be
+distributed under any other license. The requirement for fonts to
+remain under this license does not apply to any document created
+using the Font Software.
+
+TERMINATION
+This license becomes null and void if any of the above conditions are
+not met.
+
+DISCLAIMER
+THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+OTHER DEALINGS IN THE FONT SOFTWARE.
+
+Copyright 2020 The Newsreader Project Authors (http://github.com/productiontype/Newsreader)
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

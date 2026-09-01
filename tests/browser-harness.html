@@ -42,6 +42,32 @@ async function seedDatabase(rows) {
   db.close();
 }
 
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function inspectDatabase() {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("ledger-web", 1);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const tx = db.transaction(["fragments", "meta"], "readonly");
+  const [fragments, meta] = await Promise.all([
+    requestResult(tx.objectStore("fragments").getAll()),
+    requestResult(tx.objectStore("meta").getAll()),
+  ]);
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error("inspection transaction failed"));
+  });
+  db.close();
+  return { fragments, meta };
+}
+
 async function holdFragmentWrites() {
   const db = await new Promise((resolve, reject) => {
     const request = indexedDB.open("ledger-web");
@@ -79,6 +105,27 @@ async function until(check, message = "condition timed out") {
 const frame = document.createElement("iframe");
 const frameWin = () => frame.contentWindow;
 const frameDoc = () => frame.contentDocument;
+
+async function attachTestFrame() {
+  const target = document.createElement("iframe");
+  const loaded = new Promise((resolve) => target.addEventListener("load", resolve, { once: true }));
+  target.src = "../index.html?test=1";
+  document.body.append(target);
+  await loaded;
+  await until(() => Boolean(target.contentWindow?.__ledgerTest), "test interface missing");
+  return target;
+}
+
+async function loadTestFrame() {
+  const target = await attachTestFrame();
+  await target.contentWindow.__ledgerTest.ready;
+  return target;
+}
+
+function closeTestFrame(target) {
+  target.contentWindow?.__ledgerTest?.closeDatabase();
+  target.remove();
+}
 
 async function ready() {
   await until(() => Boolean(frameWin()?.__ledgerTest), "test interface missing");
@@ -197,6 +244,195 @@ async function runFocusedOverlap() {
   result.textContent = "overlapping captures left no stale draft";
 }
 
+async function runFocusedTimestamps() {
+  await deleteDatabase("ledger-web");
+  localStorage.clear();
+  let target = await loadTestFrame();
+  let win = target.contentWindow;
+  let doc = target.contentDocument;
+  const importNow = Date.now();
+  const invalidBackup = {
+    format: "ledger-web",
+    version: 1,
+    exportedAt: importNow,
+    fragments: [
+      { id: "fractional", createdAt: 1.5, text: "fractional" },
+      { id: "outside-date", createdAt: 8_640_000_000_000_001, text: "outside" },
+      {
+        id: "bad-window", createdAt: importNow, text: "bad window",
+        deletedAt: importNow, undoUntil: importNow + 30_001,
+      },
+    ],
+  };
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([JSON.stringify(invalidBackup)], "invalid.json", { type: "application/json" }));
+  const fileInput = doc.querySelector("#fileInput");
+  fileInput.files = transfer.files;
+  fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+  await until(() => fileInput.value === "" && doc.querySelector("#status").textContent,
+    "invalid JSON import did not finish");
+  assert((await win.__ledgerTest.readAll()).fragments.length === 0,
+    "invalid JSON timestamp reached durable IndexedDB");
+  assert(/3 invalid/i.test(doc.querySelector("#status").textContent),
+    "invalid JSON timestamps were not reported");
+  const previous = doc;
+  const reloaded = new Promise((resolve) => target.addEventListener("load", resolve, { once: true }));
+  win.location.reload();
+  await reloaded;
+  await until(() => target.contentDocument !== previous && Boolean(target.contentWindow?.__ledgerTest),
+    "invalid JSON reload lost the test interface");
+  await target.contentWindow.__ledgerTest.ready;
+  assert(target.contentDocument.querySelector("#recovery").hidden,
+    "rejected invalid JSON left startup unusable after reload");
+  closeTestFrame(target);
+
+  await deleteDatabase("ledger-web");
+  localStorage.setItem("ledger.fragments", JSON.stringify([
+    { id: "legacy-valid", at: 10, text: "valid legacy" },
+    { id: "legacy-fractional", at: 1.5, text: "fractional legacy" },
+    { id: "legacy-outside", at: 8_640_000_000_000_001, text: "outside legacy" },
+  ]));
+  target = await loadTestFrame();
+  let snapshot = await target.contentWindow.__ledgerTest.readAll();
+  assert(snapshot.fragments.length === 1 && snapshot.fragments[0].id === "legacy-valid",
+    "invalid legacy timestamps were written");
+  assert(localStorage.getItem("ledger.fragments") === null,
+    "successful valid subset migration did not remove legacy storage");
+  closeTestFrame(target);
+
+  await deleteDatabase("ledger-web");
+  localStorage.clear();
+  const now = Date.now();
+  await seedDatabase([
+    { id: "stored-valid", createdAt: 1, text: "valid stored" },
+    { id: "stored-invalid", createdAt: 8_640_000_000_000_001, text: "invalid stored" },
+    { id: "stored-orphan", createdAt: 2, text: "orphan tombstone", deletedAt: 3 },
+    {
+      id: "far-future", createdAt: now, text: "future tombstone",
+      deletedAt: 8_640_000_000_000_000 - 30_000, undoUntil: 8_640_000_000_000_000,
+    },
+  ]);
+  target = await loadTestFrame();
+  win = target.contentWindow;
+  doc = target.contentDocument;
+  snapshot = await win.__ledgerTest.readAll();
+  assert(snapshot.fragments.length === 2
+    && snapshot.fragments.some((row) => row.id === "stored-valid")
+    && snapshot.fragments.some((row) => row.id === "far-future"),
+  "startup did not isolate invalid durable rows");
+  const durable = await inspectDatabase();
+  const quarantine = durable.meta.find((row) => row.key === "quarantinedFragments");
+  assert(quarantine?.value?.length === 2, "invalid durable rows were not quarantined");
+  assert(/2 invalid stored fragments quarantined/i.test(doc.querySelector("#status").textContent),
+    "quarantined durable rows were not reported");
+  assert(win.__ledgerTest.nextExpiryDelay() === 2_147_483_647,
+    "far-future expiry was not scheduled with a bounded delay");
+  closeTestFrame(target);
+  document.body.dataset.status = "pass";
+  result.textContent = "invalid timestamps were rejected or quarantined without breaking reload";
+}
+
+async function runFocusedMigration() {
+  const legacy = [
+    { id: "legacy-stable", at: 10, text: "stable" },
+    { id: "legacy-stable", at: 11, text: "duplicate id" },
+    { at: 12, text: "missing id" },
+  ];
+  await deleteDatabase("ledger-web");
+  localStorage.setItem("ledger.fragments", JSON.stringify(legacy));
+  let target = await loadTestFrame();
+  let durable = await inspectDatabase();
+  assert(durable.fragments.length === 3 && new Set(durable.fragments.map((row) => row.id)).size === 3,
+    "successful migration did not preserve three uniquely identified rows");
+  assert(durable.meta.some((row) => row.key === "localStorageMigration"),
+    "successful migration did not write its marker");
+  assert(localStorage.getItem("ledger.fragments") === null,
+    "successful migration removed neither legacy storage nor completed atomically");
+  closeTestFrame(target);
+
+  const laterMalformed = "{ later legacy value must stay untouched";
+  localStorage.setItem("ledger.fragments", laterMalformed);
+  target = await loadTestFrame();
+  assert(target.contentDocument.querySelector("#recovery").hidden,
+    "completed migration ran again for a later malformed legacy value");
+  assert(localStorage.getItem("ledger.fragments") === laterMalformed,
+    "completed migration removed a later legacy value it did not import");
+  closeTestFrame(target);
+
+  await deleteDatabase("ledger-web");
+  const raw = JSON.stringify(legacy);
+  localStorage.setItem("ledger.fragments", raw);
+  sessionStorage.setItem("ledger.testMigrationFailure", "abort");
+  target = await loadTestFrame();
+  durable = await inspectDatabase();
+  assert(durable.fragments.length === 0
+    && !durable.meta.some((row) => row.key === "localStorageMigration"),
+  "forced migration abort left partial IndexedDB state");
+  assert(localStorage.getItem("ledger.fragments") === raw,
+    "forced migration abort removed legacy storage");
+  closeTestFrame(target);
+
+  await deleteDatabase("ledger-web");
+  await seedDatabase([]);
+  localStorage.setItem("ledger.fragments", raw);
+  const releaseWrites = await holdFragmentWrites();
+  const firstLoading = attachTestFrame();
+  const secondLoading = attachTestFrame();
+  const [first, second] = await Promise.all([firstLoading, secondLoading]);
+  await wait(100);
+  await releaseWrites();
+  await Promise.all([
+    first.contentWindow.__ledgerTest.ready,
+    second.contentWindow.__ledgerTest.ready,
+  ]);
+  durable = await inspectDatabase();
+  assert(durable.fragments.length === 3 && new Set(durable.fragments.map((row) => row.id)).size === 3,
+    "concurrent first-start migration duplicated missing or repeated legacy IDs");
+  assert(durable.meta.filter((row) => row.key === "localStorageMigration").length === 1,
+    "concurrent first-start migration did not converge on one marker");
+  assert(localStorage.getItem("ledger.fragments") === null,
+    "concurrent completed migration did not remove legacy storage");
+  closeTestFrame(first);
+  closeTestFrame(second);
+  document.body.dataset.status = "pass";
+  result.textContent = "migration was successful, abort-safe, and concurrent-start idempotent";
+}
+
+async function runFocusedExports() {
+  await deleteDatabase("ledger-web");
+  localStorage.clear();
+  const first = await loadTestFrame();
+  const second = await loadTestFrame();
+  await second.contentWindow.__ledgerTest.appendFragmentDirect("written in another tab");
+  assert(!first.contentDocument.querySelector("#stream").textContent.includes("written in another tab"),
+    "first context unexpectedly refreshed its session rendering");
+
+  first.contentDocument.querySelector("#exportJson").click();
+  await until(() => first.contentWindow.__ledgerTest.lastDownload()?.name.endsWith(".json"),
+    "cross-tab Backup was not prepared");
+  const backup = JSON.parse(first.contentWindow.__ledgerTest.lastDownload().text);
+  assert(backup.fragments.some((row) => row.text === "written in another tab"),
+    "Backup omitted another context's durable fragment");
+
+  first.contentDocument.querySelector("#exportMarkdown").click();
+  await until(() => first.contentWindow.__ledgerTest.lastDownload()?.name.endsWith(".md"),
+    "cross-tab Markdown was not prepared");
+  assert(first.contentWindow.__ledgerTest.lastDownload().text.includes("written in another tab"),
+    "Markdown omitted another context's durable fragment");
+
+  first.contentWindow.__ledgerTest.failNextExportRead();
+  first.contentDocument.querySelector("#exportJson").click();
+  await until(() => /session snapshot/i.test(first.contentDocument.querySelector("#status").textContent),
+    "unreadable storage fallback was not explicitly labelled as a session snapshot");
+  const fallback = JSON.parse(first.contentWindow.__ledgerTest.lastDownload().text);
+  assert(!fallback.fragments.some((row) => row.text === "written in another tab"),
+    "session-snapshot fallback claimed another context's unseen fragment");
+  closeTestFrame(first);
+  closeTestFrame(second);
+  document.body.dataset.status = "pass";
+  result.textContent = "exports read fresh cross-context storage with an explicit session fallback";
+}
+
 async function verifyRestoreAbort() {
   const before = await frameWin().__ledgerTest.readAll();
   await frameWin().__ledgerTest.seedStoredOnly([
@@ -286,6 +522,15 @@ async function runDeletionChecks() {
   assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "toast did not target the newest deletion");
   frameDoc().querySelector("#recentlyDeleted").click();
   assert(undoButton(first.id) && undoButton(second.id), "not every recent deletion was accessible");
+  const undoActions = [undoButton(first.id), undoButton(second.id)];
+  const undoNames = undoActions.map((button) => button.getAttribute("aria-label"));
+  assert(undoNames.every(Boolean) && new Set(undoNames).size === 2,
+    "two Recently Deleted Undo actions did not have distinct accessible names");
+  for (const button of undoActions) {
+    const description = button.getAttribute("aria-describedby");
+    assert(description && frameDoc().getElementById(description)?.textContent,
+      "Recently Deleted Undo action had no accessible fragment description");
+  }
   frameDoc().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
   assert(!frameDoc().querySelector("#deletedDialog").open, "Escape did not close the open dialog");
   assert(frameDoc().activeElement === frameDoc().querySelector("#recentlyDeleted"),
@@ -330,6 +575,19 @@ async function runDeletionChecks() {
 
 async function run() {
   result.textContent = "deleting database";
+  const focus = new URL(location.href).searchParams.get("focus");
+  if (focus === "timestamps") {
+    await runFocusedTimestamps();
+    return;
+  }
+  if (focus === "migration") {
+    await runFocusedMigration();
+    return;
+  }
+  if (focus === "exports") {
+    await runFocusedExports();
+    return;
+  }
   await deleteDatabase("ledger-web");
   localStorage.clear();
   const malformedLegacy = "{ untouched malformed legacy";
@@ -455,13 +713,29 @@ async function run() {
   assert(!frameDoc().querySelector("#recovery").hidden, "malformed legacy recovery was not shown");
   assert(!frameDoc().querySelector("#downloadLegacy").hidden,
     "malformed legacy recovery did not offer the raw download");
+  let dismissalWarning = "";
+  frameWin().confirm = (message) => {
+    dismissalWarning = message;
+    return true;
+  };
+  frameDoc().querySelector("#dismissLegacy").click();
+  assert(/untouched|not imported|download/i.test(dismissalWarning),
+    "malformed legacy dismissal did not require a clear preservation warning");
+  assert(frameDoc().querySelector("#recovery").hidden
+    && !frameDoc().querySelector("#showLegacyData").hidden,
+  "malformed legacy warning could not be dismissed to a recoverable reminder");
+  assert(localStorage.getItem("ledger.fragments") === malformedLegacy,
+    "malformed legacy dismissal changed the raw data");
+  frameDoc().querySelector("#showLegacyData").click();
+  assert(!frameDoc().querySelector("#recovery").hidden
+    && !frameDoc().querySelector("#downloadLegacy").hidden,
+  "dismissed malformed legacy data could not be reopened for download");
   localStorage.removeItem("ledger.fragments");
   frameDoc().querySelector("#retryStartup").click();
   await until(() => frameDoc().querySelector("#recovery").hidden
     && !frameDoc().querySelector("#save").disabled, "startup retry did not recover");
   assert(frameDoc().querySelector("#entry").value === "quota composer must remain exact",
     "successful startup retry replaced the quota composer text");
-  const focus = new URL(location.href).searchParams.get("focus");
   if (focus === "overlap") {
     await runFocusedOverlap();
     return;
@@ -592,6 +866,8 @@ async function run() {
   search.value = "batch";
   search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "h" }));
   assert(frameDoc().querySelectorAll("#stream .frag").length === 100, "query change did not reset the render batch to 100");
+  assert(frameDoc().querySelector("#counts").textContent === "100 of 247 matches",
+    "bounded search count did not distinguish shown from total matches");
   search.value = "";
   search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
   fragmentButton("deleted-match").click();
@@ -626,6 +902,19 @@ async function run() {
   }, "offscreen fragment was not restored");
   assert(frameDoc().activeElement === frameDoc().querySelector("#entry"),
     "Undo did not focus the composer when its restored fragment was offscreen");
+  search.value = "";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+
+  await frameWin().__ledgerTest.seedFragments([
+    ...rows,
+    { id: "unicode-highlight", createdAt: 251, text: "İx uniqueunicode" },
+  ]);
+  search.value = "x uniqueunicode";
+  search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "e" }));
+  const unicodeBody = frameDoc().querySelector('[data-fragment-id="unicode-highlight"] .body');
+  assert(unicodeBody?.textContent === "İx uniqueunicode", "Unicode highlight changed fragment text");
+  assert(unicodeBody.querySelector("mark")?.textContent === "x",
+    "Unicode lowercase expansion highlighted the wrong original range");
   search.value = "";
   search.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
 

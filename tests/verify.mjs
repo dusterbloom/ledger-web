@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -8,13 +8,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const appPath = resolve(root, "index.html");
 const browserPath = resolve(root, "tests/browser-smoke.mjs");
 const readApp = () => readFileSync(appPath, "utf8");
-
-const legalFiles = [
-  "LICENSE",
-  "THIRD_PARTY_NOTICES.md",
-  "ThirdPartyLicenses/Literata-OFL.txt",
-  "ThirdPartyLicenses/WorkSans-OFL.txt",
-];
 
 function legalBlock(html) {
   const match = html.match(/<template id="legalNotices">([\s\S]*?)<\/template>/);
@@ -71,9 +64,25 @@ test("release closes document trust boundaries with a restrictive CSP", () => {
 });
 
 test("repository and standalone app retain required legal notices and credit", () => {
-  const embedded = legalBlock(readApp());
+  const html = readApp();
+  const embedded = legalBlock(html);
+  const notices = readFileSync(resolve(root, "THIRD_PARTY_NOTICES.md"), "utf8");
+  const licenseDirectory = resolve(root, "ThirdPartyLicenses");
+  const licenseNames = readdirSync(licenseDirectory).filter((name) => name.endsWith("-OFL.txt"));
+  const fontFamilies = [...new Set([...html.matchAll(/@font-face\s*\{[^}]*font-family:"([^"]+)"/gu)]
+    .map((match) => match[1]))];
+  assert.ok(fontFamilies.length > 0, "embedded font inventory is empty");
 
-  for (const relative of legalFiles) {
+  const fontFiles = fontFamilies.map((family) => {
+    const normalizedFamily = family.replace(/[^a-z0-9]/giu, "").toLowerCase();
+    const file = licenseNames.find((name) => name.replace(/-OFL\.txt$/u, "")
+      .replace(/[^a-z0-9]/giu, "").toLowerCase() === normalizedFamily);
+    assert.ok(file, family + " embedded font license missing");
+    assert.match(notices, new RegExp(family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
+    return "ThirdPartyLicenses/" + file;
+  });
+
+  for (const relative of ["LICENSE", "THIRD_PARTY_NOTICES.md", ...fontFiles]) {
     const path = resolve(root, relative);
     assert.ok(existsSync(path), relative + " missing");
     const notice = normalizeNotice(readFileSync(path, "utf8"));
@@ -133,7 +142,10 @@ test("narrow viewport header wraps before its controls overflow", () => {
 
 test("capture, search, stream, status, and recovery controls are semantic", () => {
   const html = readApp();
-  for (const id of ["entry", "save", "search", "stream", "status", "recentlyDeleted", "retryStartup"]) {
+  for (const id of [
+    "entry", "save", "search", "stream", "status", "recentlyDeleted", "retryStartup",
+    "dismissLegacy", "showLegacyData",
+  ]) {
     assert.match(html, new RegExp('id="' + id + '"'), id + " missing");
   }
   assert.match(html, /<label[^>]*for="entry"/);
@@ -154,12 +166,38 @@ test("fragment helpers preserve meaningful whitespace and classify tombstones", 
   assert.equal(isLive({ id: "a", createdAt: 1, text: "x", deletedAt: 10, undoUntil: 200 }), false);
 });
 
+test("all record timestamps stay inside the safe ECMAScript Date domain", () => {
+  const { hasValidTimestamp, validStoredRecord, boundedExpiryDelay } = extractTestableLogic(readApp(), [
+    "hasValidTimestamp", "validStoredRecord", "boundedExpiryDelay",
+  ]);
+  const maxDate = 8_640_000_000_000_000;
+  for (const value of [0, 1, maxDate]) assert.equal(hasValidTimestamp(value), true, String(value));
+  for (const value of [-1, 0.5, maxDate + 1, Number.MAX_SAFE_INTEGER, 1e300, NaN, Infinity]) {
+    assert.equal(hasValidTimestamp(value), false, String(value));
+  }
+
+  const live = { id: "live", createdAt: 1, text: "kept" };
+  const tombstone = { id: "gone", createdAt: 1, text: "gone", deletedAt: 70, undoUntil: 100 };
+  assert.deepEqual(validStoredRecord(live), live);
+  assert.deepEqual(validStoredRecord(tombstone), tombstone);
+  for (const invalid of [
+    { ...live, createdAt: 1.5 },
+    { ...live, createdAt: maxDate + 1 },
+    { ...live, deletedAt: 2 },
+    { ...tombstone, deletedAt: 0 },
+    { ...tombstone, undoUntil: 69 },
+    { ...tombstone, undoUntil: 30_071 },
+  ]) assert.equal(validStoredRecord(invalid), null, JSON.stringify(invalid));
+  assert.equal(boundedExpiryDelay(maxDate, 0), 2_147_483_647);
+  assert.equal(boundedExpiryDelay(99, 100), 0);
+});
+
 test("only unexpired tombstones remain undoable", () => {
   const { unexpiredTombstones } = extractTestableLogic(readApp(), ["unexpiredTombstones"]);
   const rows = [
     { id: "live", text: "x", createdAt: 1 },
-    { id: "old", text: "x", createdAt: 1, deletedAt: 2, undoUntil: 99 },
-    { id: "new", text: "x", createdAt: 1, deletedAt: 2, undoUntil: 101 },
+    { id: "old", text: "x", createdAt: 1, deletedAt: 69, undoUntil: 99 },
+    { id: "new", text: "x", createdAt: 1, deletedAt: 71, undoUntil: 101 },
   ];
   assert.deepEqual(unexpiredTombstones(rows, 100).map(row => row.id), ["new"]);
 });
@@ -191,6 +229,21 @@ test("search sorts matching live records and slices requested batches", () => {
   assert.deepEqual(visibleSlice(rows, 2).map(row => row.id), ["z", "a"]);
 });
 
+test("highlight ranges map lowercase expansions back to the original text", () => {
+  const { highlightRanges } = extractTestableLogic(readApp(), ["highlightRanges"]);
+  assert.deepEqual(highlightRanges("İx", ["x"]), [[1, 2]]);
+  assert.deepEqual(highlightRanges("AİxB", ["i̇x"]), [[1, 3]]);
+  assert.deepEqual(highlightRanges("ΟΣ", ["ς"]), [[1, 2]]);
+});
+
+test("bounded counts distinguish shown search matches from their total", () => {
+  const { resultCountLabel } = extractTestableLogic(readApp(), ["resultCountLabel"]);
+  assert.equal(resultCountLabel(100, 250, true), "100 of 250 matches");
+  assert.equal(resultCountLabel(1, 1, true), "1 match");
+  assert.equal(resultCountLabel(12, 12, true), "12 matches");
+  assert.equal(resultCountLabel(100, 250, false), "100 of 250 fragments");
+});
+
 test("fragment IDs prefer UUIDs and fall back to timestamp plus random entropy", () => {
   const { makeId } = extractTestableLogic(readApp(), ["makeId"]);
   assert.equal(makeId(42, () => "uuid-preferred", () => 0.5), "uuid-preferred");
@@ -210,6 +263,47 @@ test("legacy records generate unique IDs for missing and duplicate IDs", () => {
   assert.notEqual(duplicateId.id, missingId.id);
   assert.ok(used.has(missingId.id));
   assert.ok(used.has(duplicateId.id));
+  assert.equal(normalizeLegacyRecord({ at: 1.5, text: "fractional" }, used, 99), null);
+  assert.equal(normalizeLegacyRecord({ at: 8_640_000_000_000_001, text: "out of range" }, used, 99), null);
+});
+
+test("a completed migration never touches unavailable legacy storage", async () => {
+  const { migrateLegacy } = extractTestableLogic(readApp(), ["migrateLegacy"]);
+  let storageReads = 0;
+  const tx = {
+    objectStore(name) {
+      assert.ok(["fragments", "meta"].includes(name));
+      return {
+        get(key) {
+          assert.equal(name, "meta");
+          assert.equal(key, "localStorageMigration");
+          const request = {};
+          queueMicrotask(() => {
+            request.result = { key, value: true };
+            request.onsuccess();
+            queueMicrotask(() => tx.oncomplete());
+          });
+          return request;
+        },
+      };
+    },
+  };
+  const db = {
+    transaction(stores, mode) {
+      assert.deepEqual(stores, ["fragments", "meta"]);
+      assert.equal(mode, "readwrite");
+      return tx;
+    },
+  };
+  const unavailableStorage = {
+    getItem() {
+      storageReads += 1;
+      throw new DOMException("restricted", "SecurityError");
+    },
+  };
+
+  assert.deepEqual(await migrateLegacy(db, unavailableStorage), { status: "already-migrated" });
+  assert.equal(storageReads, 0);
 });
 
 test("capture helpers are exposed from the testable application logic", () => {
@@ -251,10 +345,11 @@ test("composer autofocus is limited to fine pointers with no existing focus", ()
 test("backup preserves stored fields and excludes only expired tombstones", () => {
   const { makeBackup, validateBackup } = extractTestableLogic(readApp(), ["makeBackup", "validateBackup"]);
   const live = { id: "live", createdAt: 1, text: "kept", source: "capture" };
-  const undoable = { id: "undoable", createdAt: 2, text: "pending", deletedAt: 3, undoUntil: 101 };
-  const expired = { id: "expired", createdAt: 4, text: "gone", deletedAt: 5, undoUntil: 100 };
+  const undoable = { id: "undoable", createdAt: 2, text: "pending", deletedAt: 71, undoUntil: 101 };
+  const expired = { id: "expired", createdAt: 4, text: "gone", deletedAt: 70, undoUntil: 100 };
+  const invalid = { id: "invalid", createdAt: 8_640_000_000_000_001, text: "must not export" };
 
-  const backup = makeBackup([expired, undoable, live], 100);
+  const backup = makeBackup([expired, invalid, undoable, live], 100);
   assert.deepEqual(backup, {
     format: "ledger-web",
     version: 1,
@@ -279,12 +374,16 @@ test("backup validation rejects unsupported documents and skips invalid records"
       { createdAt: 2, text: "generated id" },
       { id: "empty", createdAt: 3, text: "  \n" },
       { id: "expired", createdAt: 4, text: "gone", deletedAt: 5, undoUntil: 100 },
+      { id: "fractional", createdAt: 1.5, text: "bad timestamp" },
+      { id: "out-of-range", createdAt: 8_640_000_000_000_001, text: "bad timestamp" },
+      { id: "reversed", createdAt: 4, text: "bad tombstone", deletedAt: 3, undoUntil: 20 },
+      { id: "long-window", createdAt: 4, text: "bad tombstone", deletedAt: 5, undoUntil: 30_006 },
       { id: "extra", createdAt: 6, text: "unknown", surprise: true },
     ],
   }, 100);
 
   assert.equal(result.valid, true);
-  assert.equal(result.invalid, 3);
+  assert.equal(result.invalid, 7);
   assert.deepEqual(result.fragments.map((row) => row.id === "valid" ? row : {
     createdAt: row.createdAt, text: row.text,
   }), [
@@ -353,19 +452,21 @@ test("text import preserves blocks and assigns ordered provenance", () => {
   ]);
   assert.equal(rows.every((row) => typeof row.id === "string" && row.id), true);
 
-  const boundary = textImportRecords("one\n\ntwo\n\nthree", "huge.txt", Number.MAX_VALUE);
+  const boundary = textImportRecords("one\n\ntwo\n\nthree", "huge.txt", 8_640_000_000_000_000);
   assert.deepEqual(boundary.map((row) => row.createdAt), [
-    Number.MAX_SAFE_INTEGER - 2,
-    Number.MAX_SAFE_INTEGER - 1,
-    Number.MAX_SAFE_INTEGER,
+    8_640_000_000_000_000 - 2,
+    8_640_000_000_000_000 - 1,
+    8_640_000_000_000_000,
   ]);
-  assert.equal(boundary.every((row) => Number.isSafeInteger(row.createdAt)), true);
+  assert.equal(boundary.every((row) => Number.isSafeInteger(row.createdAt)
+    && row.createdAt <= 8_640_000_000_000_000), true);
 });
 
 test("Markdown archive is chronological and escapes fragment structure", () => {
   const { markdownArchive } = extractTestableLogic(readApp(), ["markdownArchive"]);
   const output = markdownArchive([
     { id: "new", createdAt: 2000, text: "# newer\n- list\n* star [link]" },
+    { id: "invalid-date", createdAt: 8_640_000_000_000_001, text: "must be omitted" },
     { id: "deleted", createdAt: 1500, text: "hidden", deletedAt: 1600, undoUntil: 9999 },
     {
       id: "old", createdAt: 1000, text: "# older",
@@ -380,6 +481,7 @@ test("Markdown archive is chronological and escapes fragment structure", () => {
   ));
   assert.doesNotMatch(output, /\n(?:```|~~~|===|---|- forged item|# forged heading)/u);
   assert.doesNotMatch(output, /hidden/u);
+  assert.doesNotMatch(output, /must be omitted/u);
 });
 
 test("downloads revoke their temporary object URL even when clicking fails", () => {

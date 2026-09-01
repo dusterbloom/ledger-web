@@ -265,11 +265,14 @@ try {
   await cdp.call("Runtime.enable");
   await waitForHarness(cdp, deadline);
   if (browserFailures.length) throw new Error("Browser page errors:\n" + browserFailures.join("\n"));
-  console.log(focus === "overlap"
-    ? "PASS: overlapping captures left no stale draft"
-    : focus === "restore"
-      ? "PASS: aborted restore changed neither disk nor memory"
-      : "PASS: recovered drafts, preserved pending edits, and capped rendering");
+  const focusMessages = {
+    overlap: "PASS: overlapping captures left no stale draft",
+    restore: "PASS: aborted restore changed neither disk nor memory",
+    timestamps: "PASS: invalid timestamps were rejected or quarantined without breaking reload",
+    migration: "PASS: migration was successful, abort-safe, and concurrent-start idempotent",
+    exports: "PASS: exports read fresh cross-context storage with an explicit session fallback",
+  };
+  console.log(focusMessages[focus] || "PASS: recovered drafts, preserved pending edits, and capped rendering");
 } catch (error) {
   if (browser?.stderr()) error.message += "\n" + browser.stderr();
   throw error;
