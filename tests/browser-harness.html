@@ -20,6 +20,28 @@ function deleteDatabase(name) {
   });
 }
 
+async function seedDatabase(rows) {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("ledger-web", 1);
+    request.onupgradeneeded = () => {
+      const next = request.result;
+      const fragments = next.createObjectStore("fragments", { keyPath: "id" });
+      fragments.createIndex("createdAt", "createdAt");
+      fragments.createIndex("undoUntil", "undoUntil");
+      next.createObjectStore("meta", { keyPath: "key" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const tx = db.transaction("fragments", "readwrite");
+  for (const row of rows) tx.objectStore("fragments").put(row);
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = resolve;
+    tx.onabort = tx.onerror = () => reject(tx.error || new Error("seed transaction failed"));
+  });
+  db.close();
+}
+
 async function holdFragmentWrites() {
   const db = await new Promise((resolve, reject) => {
     const request = indexedDB.open("ledger-web");
@@ -298,13 +320,53 @@ async function run() {
   localStorage.clear();
   const malformedLegacy = "{ untouched malformed legacy";
   localStorage.setItem("ledger.fragments", malformedLegacy);
-  sessionStorage.setItem("ledger.testStartupFailure", "blocked");
+  const startupNow = Date.now();
+  await seedDatabase([
+    { id: "startup-readable", createdAt: 1, text: "existing backup data" },
+    {
+      id: "startup-tombstone", createdAt: 2, text: "existing deleted data",
+      deletedAt: startupNow, undoUntil: startupNow + 30000,
+    },
+  ]);
+  sessionStorage.setItem("ledger.testStartupFailure", "quota-after-open");
   result.textContent = "loading application";
   const loaded = new Promise((resolve) => frame.addEventListener("load", resolve, { once: true }));
   frame.src = "../index.html?test=1";
   document.body.append(frame);
   await loaded;
   await ready();
+  assert(/backup|markdown/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
+    "readable startup quota did not offer an available export path");
+  assert(!frameDoc().querySelector("#exportJson").disabled
+    && !frameDoc().querySelector("#exportMarkdown").disabled,
+  "readable startup quota disabled its export actions");
+  assert(frameDoc().querySelector("#save").disabled && frameDoc().querySelector("#import").disabled,
+    "readable startup quota left persistence actions enabled");
+  const readableQuota = await frameWin().__ledgerTest.readAll();
+  assert(readableQuota.fragments.length === 2
+    && readableQuota.fragments.some((fragment) => fragment.text === "existing backup data"),
+  "startup quota did not preserve a verified readable snapshot");
+  assert(frameDoc().querySelector(".drop").disabled
+    && frameDoc().querySelector("#undo").disabled
+    && frameDoc().querySelector("#recentlyDeleted").disabled,
+  "readable startup quota left fragment mutation controls enabled");
+  frameDoc().querySelector("#exportJson").click();
+  await until(() => frameDoc().querySelector("#status").textContent === "Backup ready to download.",
+    "readable startup quota Backup action did not work");
+  frameWin().__ledgerTest.closeDatabase();
+  await deleteDatabase("ledger-web");
+  frameWin().sessionStorage.setItem("ledger.testStartupFailure", "quota-before-open");
+  await reloadFrame();
+  assert(!/backup|markdown/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
+    "no-data startup quota recommended disabled export actions");
+  assert(frameDoc().querySelector("#exportJson").disabled
+    && frameDoc().querySelector("#exportMarkdown").disabled,
+  "no-data startup quota enabled export actions without a readable snapshot");
+  inputText(frameDoc().querySelector("#entry"), "quota composer must remain exact");
+  frameWin().sessionStorage.setItem("ledger.testStartupFailure", "blocked");
+  frameDoc().querySelector("#retryStartup").click();
+  await until(() => /other Ledger tabs/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
+    "retry after no-data quota did not reach blocked startup recovery");
   assert(!frameDoc().querySelector("#recovery").hidden, "blocked startup recovery was not shown");
   assert(/other Ledger tabs/i.test(frameDoc().querySelector("#recoveryMessage").textContent),
     "blocked startup did not explain how to unblock storage");
@@ -314,6 +376,8 @@ async function run() {
   frameDoc().querySelector("#retryStartup").click();
   await until(() => !frameDoc().querySelector("#downloadLegacy").hidden,
     "retry after blocked startup did not reach malformed legacy recovery");
+  assert(frameDoc().querySelector("#entry").value === "quota composer must remain exact",
+    "startup quota retries changed the exact composer text");
   assert(localStorage.getItem("ledger.fragments") === malformedLegacy,
     "malformed legacy data changed during startup");
   assert(!frameDoc().querySelector("#recovery").hidden, "malformed legacy recovery was not shown");
@@ -323,6 +387,8 @@ async function run() {
   frameDoc().querySelector("#retryStartup").click();
   await until(() => frameDoc().querySelector("#recovery").hidden
     && !frameDoc().querySelector("#save").disabled, "startup retry did not recover");
+  assert(frameDoc().querySelector("#entry").value === "quota composer must remain exact",
+    "successful startup retry replaced the quota composer text");
   const focus = new URL(location.href).searchParams.get("focus");
   if (focus === "overlap") {
     await runFocusedOverlap();

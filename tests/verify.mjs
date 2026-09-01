@@ -55,18 +55,21 @@ test("release closes document trust boundaries with a restrictive CSP", () => {
 
 test("storage errors produce distinct actionable recovery copy", () => {
   const { describeStorageError } = extractTestableLogic(readApp(), ["describeStorageError"]);
-  const quota = describeStorageError({ name: "QuotaExceededError" });
+  const quotaWithBackup = describeStorageError({ name: "QuotaExceededError" }, true);
+  const quotaWithoutBackup = describeStorageError({ name: "QuotaExceededError" }, false);
   const blocked = describeStorageError(new Error("database-blocked"));
   const restricted = describeStorageError({ name: "SecurityError" });
   const malformed = describeStorageError(new Error("legacy-malformed"));
   const generic = describeStorageError(new Error("transaction-failed"));
-  assert.match(quota, /backup|markdown/i);
+  assert.match(quotaWithBackup, /backup|markdown/i);
+  assert.doesNotMatch(quotaWithoutBackup, /backup|markdown/i);
+  assert.match(quotaWithoutBackup, /free|retry/i);
   assert.match(blocked, /other Ledger tabs/i);
   assert.match(blocked, /retry/i);
   assert.match(restricted, /browser|private|storage/i);
   assert.match(malformed, /legacy|download/i);
   assert.match(generic, /not saved|retry/i);
-  assert.equal(new Set([quota, blocked, restricted, malformed, generic]).size, 5);
+  assert.equal(new Set([quotaWithBackup, quotaWithoutBackup, blocked, restricted, malformed, generic]).size, 6);
 });
 
 test("responsive accessibility keeps controls visible and respects user settings", () => {

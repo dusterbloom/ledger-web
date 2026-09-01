@@ -251,7 +251,7 @@ try {
     `--user-data-dir=${profile}`,
     harnessUrl,
   ]);
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + 30000;
   const devtoolsUrl = await browser.devtools;
   const targetUrl = await findHarness(devtoolsUrl, harnessUrl, deadline);
   cdp = await connectCdp(targetUrl, deadline);

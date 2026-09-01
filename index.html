@@ -112,11 +112,13 @@ function hasValidTimestamp(value) {
   return Number.isFinite(value) && value >= 0;
 }
 
-function describeStorageError(error) {
+function describeStorageError(error, canExport = false) {
   const name = typeof error?.name === "string" ? error.name : "";
   const message = typeof error?.message === "string" ? error.message : String(error || "");
   if (name === "QuotaExceededError") {
-    return "Storage is full. Use Backup or Markdown, free some space, then retry.";
+    return canExport
+      ? "Storage is full. Use Backup or Markdown, free some space, then retry."
+      : "Storage is full. Your text is still here. Free some space, then retry.";
   }
   if (message.includes("database-blocked")) {
     return "Another Ledger connection blocked storage. Close other Ledger tabs, then retry.";
@@ -404,9 +406,11 @@ function downloadFile(name, text, type) {
 }
 
 function openDatabase() {
-  if (isTestMode(location) && sessionStorage.getItem(TEST_STARTUP_FAILURE_KEY) === "blocked") {
-    sessionStorage.removeItem(TEST_STARTUP_FAILURE_KEY);
+  if (takeTestStartupFailure("blocked")) {
     return Promise.reject(new Error("database-blocked"));
+  }
+  if (takeTestStartupFailure("quota-before-open")) {
+    return Promise.reject(new DOMException("test-startup-quota", "QuotaExceededError"));
   }
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -499,6 +503,10 @@ async function migrateLegacy(db) {
 
 async function loadState(db, now) {
   await purgeExpired(db, now);
+  return readStateSnapshot(db);
+}
+
+async function readStateSnapshot(db) {
   const tx = db.transaction(["fragments", "meta"], "readonly");
   const [storedFragments, draftRecord] = await Promise.all([
     requestResult(tx.objectStore("fragments").getAll()),
@@ -513,6 +521,12 @@ function isTestMode(currentLocation) {
   const hostname = currentLocation.hostname;
   return new URL(currentLocation.href).searchParams.has("test")
     && (hostname === "127.0.0.1" || hostname === "localhost");
+}
+
+function takeTestStartupFailure(kind) {
+  if (!isTestMode(location) || sessionStorage.getItem(TEST_STARTUP_FAILURE_KEY) !== kind) return false;
+  sessionStorage.removeItem(TEST_STARTUP_FAILURE_KEY);
+  return true;
 }
 
 function currentTime() {
@@ -701,6 +715,8 @@ let draftFailureAnnounced = false;
 let draftFailureAnnouncementCount = 0;
 let legacyRecoveryRaw = null;
 let importReturnPending = false;
+let persistenceWritable = false;
+let hasVerifiedReadableSnapshot = false;
 let inputRevision = 0;
 let captureQueue = Promise.resolve();
 let state = { fragments: [] };
@@ -711,22 +727,23 @@ function announce(message) {
 }
 
 function setRecoveryState(kind, details) {
-  const readyForWrites = Boolean(database) && (kind === "ready" || kind === "malformed" || kind === "quota");
-  const hasReadableState = Boolean(database) || state.fragments.length > 0;
-  document.querySelector("#save").disabled = !readyForWrites;
-  importButton.disabled = !readyForWrites;
-  exportJson.disabled = !hasReadableState;
-  exportMarkdown.disabled = !hasReadableState;
+  persistenceWritable = Boolean(database) && (kind === "ready" || kind === "malformed");
+  const canExport = hasVerifiedReadableSnapshot && (kind !== "quota" || state.fragments.length > 0);
+  document.querySelector("#save").disabled = !persistenceWritable;
+  importButton.disabled = !persistenceWritable;
+  exportJson.disabled = !canExport;
+  exportMarkdown.disabled = !canExport;
   recovery.hidden = kind === "ready" || kind === "loading";
   retryStartupButton.hidden = kind === "ready" || kind === "loading";
   downloadLegacy.hidden = kind !== "malformed";
   legacyRecoveryRaw = kind === "malformed" && typeof details === "string" ? details : null;
   if (kind === "ready" || kind === "loading") {
     recoveryMessage.textContent = "";
+    render();
     return;
   }
   const error = kind === "malformed" ? new Error("legacy-malformed") : details;
-  const message = describeStorageError(error);
+  const message = describeStorageError(error, canExport);
   recoveryMessage.textContent = message;
   render();
 }
@@ -774,6 +791,7 @@ function renderDeletedDialog(tombstones) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = "Undo";
+    button.disabled = !persistenceWritable;
     button.dataset.undoId = fragment.id;
     button.addEventListener("click", () => { void undoDelete(fragment.id, currentTime()); });
     row.append(preview, " ", button);
@@ -830,6 +848,8 @@ function scheduleExpiry(tombstones, now) {
 
 function renderDeletionControls(tombstones, now) {
   const newest = tombstones[0];
+  undo.disabled = !persistenceWritable;
+  recentlyDeleted.disabled = !persistenceWritable;
   undoToast.hidden = !newest;
   recentlyDeleted.hidden = !tombstones.length;
   if (newest) {
@@ -916,7 +936,7 @@ function render() {
     drop.textContent = "Delete";
     drop.dataset.fragmentId = fragment.id;
     drop.setAttribute("aria-label", "Delete fragment");
-    drop.disabled = !database;
+    drop.disabled = !persistenceWritable;
     drop.addEventListener("click", () => { void deleteFragment(fragment.id, currentTime()); });
     article.append(time, body, drop);
     stream.append(article);
@@ -937,17 +957,34 @@ async function start() {
   let migration;
   let loaded;
   try {
+    if (takeTestStartupFailure("quota-after-open")) {
+      throw new DOMException("test-startup-quota", "QuotaExceededError");
+    }
     migration = await migrateLegacy(database);
     loaded = await loadState(database, currentTime());
   } catch (error) {
+    if (error?.name === "QuotaExceededError") {
+      try {
+        loaded = await readStateSnapshot(database);
+      } catch {
+        database.close();
+        database = undefined;
+        throw error;
+      }
+      state = { fragments: loaded.fragments };
+      hasVerifiedReadableSnapshot = true;
+      restoreDraft(entry, loaded.draft, initialRevision, inputRevision);
+      resizeEntry();
+      throw error;
+    }
     database.close();
     database = undefined;
     throw error;
   }
   state = { fragments: loaded.fragments };
+  hasVerifiedReadableSnapshot = true;
   restoreDraft(entry, loaded.draft, initialRevision, inputRevision);
   resizeEntry();
-  render();
   setRecoveryState(migration.status === "malformed" ? "malformed" : "ready", migration.raw);
   if (shouldAutofocusComposer(matchMedia("(pointer: fine)").matches, document.activeElement === document.body)) {
     entry.focus();
