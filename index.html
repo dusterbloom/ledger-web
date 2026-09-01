@@ -313,7 +313,9 @@ async function restoreBackup(db, plan) {
 function textImportRecords(text, filename, modifiedAt) {
   const normalizedLines = typeof text === "string" ? text.replace(/\r\n?/gu, "\n") : "";
   const blocks = normalizedLines.split(/\n[\t ]*\n+/u).map(normalizeText).filter(Boolean);
-  const start = hasValidTimestamp(modifiedAt) ? modifiedAt : Date.now();
+  const latestStart = Number.MAX_SAFE_INTEGER - Math.max(0, blocks.length - 1);
+  const requestedStart = hasValidTimestamp(modifiedAt) ? Math.floor(modifiedAt) : Date.now();
+  const start = Math.min(requestedStart, latestStart);
   const usedIds = new Set();
   return blocks.map((block, index) => {
     const createdAt = start + index;
@@ -324,7 +326,7 @@ function textImportRecords(text, filename, modifiedAt) {
 }
 
 function escapeMarkdown(value) {
-  return value.replace(/([\\`*_{}\[\]<>()#+\-.!|>])/gu, "\\$1");
+  return value.replace(/([\\`*_{}\[\]<>()#+=~\-.!|>])/gu, "\\$1");
 }
 
 function markdownArchive(fragments, locale) {
@@ -348,7 +350,9 @@ function markdownArchive(fragments, locale) {
     lines.push("- " + timeFormat.format(created) + " — " + textLines[0]);
     for (const line of textLines.slice(1)) lines.push("    " + line);
     if (typeof fragment.source === "string" && fragment.source) {
-      lines.push("    Source: " + escapeMarkdown(fragment.source));
+      const sourceLines = fragment.source.replace(/\r\n?/gu, "\n").split("\n").map(escapeMarkdown);
+      lines.push("    Source: " + sourceLines[0]);
+      for (const line of sourceLines.slice(1)) lines.push("    " + line);
     }
   }
   return lines.join("\n") + "\n";
@@ -963,6 +967,13 @@ if (isTestMode(location)) {
     },
     failNextExpiryPurge() {
       shouldFailNextExpiryPurge = true;
+    },
+    async seedStoredOnly(rows) {
+      if (!Array.isArray(rows)) throw new TypeError("rows must be an array");
+      const tx = database.transaction("fragments", "readwrite");
+      const store = tx.objectStore("fragments");
+      for (const row of rows) store.add(row);
+      await transactionDone(tx);
     },
     async seedFragments(rows) {
       if (!Array.isArray(rows)) throw new TypeError("rows must be an array");

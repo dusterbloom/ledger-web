@@ -97,6 +97,44 @@ async function runFocusedOverlap() {
   result.textContent = "overlapping captures left no stale draft";
 }
 
+async function verifyRestoreAbort() {
+  const before = await frameWin().__ledgerTest.readAll();
+  await frameWin().__ledgerTest.seedStoredOnly([
+    { id: "restore-race", createdAt: 3, text: "already on disk" },
+  ]);
+  const durableBeforeAbort = await frameWin().__ledgerTest.readAll();
+  const visibleBeforeAbort = [...frameDoc().querySelectorAll("#stream .frag")]
+    .map((row) => row.dataset.fragmentId);
+  let restoreAborted = false;
+  try {
+    await frameWin().__ledgerTest.restoreRows([
+      { id: "abort-first", createdAt: 4, text: "must roll back" },
+      { id: "restore-race", createdAt: 5, text: "constraint failure" },
+    ]);
+  } catch {
+    restoreAborted = true;
+  }
+  assert(restoreAborted, "later duplicate add did not abort the real restore transaction");
+  const durableAfterAbort = await frameWin().__ledgerTest.readAll();
+  assert(JSON.stringify(durableAfterAbort.fragments) === JSON.stringify(durableBeforeAbort.fragments),
+    "aborted restore changed durable fragments");
+  const visibleAfterAbort = [...frameDoc().querySelectorAll("#stream .frag")]
+    .map((row) => row.dataset.fragmentId);
+  assert(JSON.stringify(visibleAfterAbort) === JSON.stringify(visibleBeforeAbort),
+    "aborted restore changed in-memory rendering");
+  await frameWin().__ledgerTest.seedFragments(before.fragments);
+}
+
+async function runFocusedRestore() {
+  await frameWin().__ledgerTest.seedFragments([
+    { id: "restore-visible", createdAt: 1, text: "original" },
+  ]);
+  await verifyRestoreAbort();
+  frameWin().__ledgerTest.closeDatabase();
+  document.body.dataset.status = "pass";
+  result.textContent = "aborted restore changed neither disk nor memory";
+}
+
 function fragmentButton(id) {
   return [...frameDoc().querySelectorAll("#stream .drop")]
     .find((button) => button.dataset.fragmentId === id);
@@ -193,8 +231,13 @@ async function run() {
   document.body.append(frame);
   await loaded;
   await ready();
-  if (new URL(location.href).searchParams.get("focus") === "overlap") {
+  const focus = new URL(location.href).searchParams.get("focus");
+  if (focus === "overlap") {
     await runFocusedOverlap();
+    return;
+  }
+  if (focus === "restore") {
+    await runFocusedRestore();
     return;
   }
 
@@ -273,6 +316,8 @@ async function run() {
     "restore conflict replaced existing text");
   assert(restoredState.fragments.find((row) => row.id === "restore-new")?.text === "added",
     "restore unique record was not committed");
+
+  await verifyRestoreAbort();
 
   const fileInput = frameDoc().querySelector("#fileInput");
   const imported = new DataTransfer();

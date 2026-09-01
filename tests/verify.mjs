@@ -248,6 +248,14 @@ test("text import preserves blocks and assigns ordered provenance", () => {
     { createdAt: 41, text: "# heading\nbody", source: "from notes.md" },
   ]);
   assert.equal(rows.every((row) => typeof row.id === "string" && row.id), true);
+
+  const boundary = textImportRecords("one\n\ntwo\n\nthree", "huge.txt", Number.MAX_VALUE);
+  assert.deepEqual(boundary.map((row) => row.createdAt), [
+    Number.MAX_SAFE_INTEGER - 2,
+    Number.MAX_SAFE_INTEGER - 1,
+    Number.MAX_SAFE_INTEGER,
+  ]);
+  assert.equal(boundary.every((row) => Number.isSafeInteger(row.createdAt)), true);
 });
 
 test("Markdown archive is chronological and escapes fragment structure", () => {
@@ -255,11 +263,18 @@ test("Markdown archive is chronological and escapes fragment structure", () => {
   const output = markdownArchive([
     { id: "new", createdAt: 2000, text: "# newer\n- list\n* star [link]" },
     { id: "deleted", createdAt: 1500, text: "hidden", deletedAt: 1600, undoUntil: 9999 },
-    { id: "old", createdAt: 1000, text: "# older" },
+    {
+      id: "old", createdAt: 1000, text: "# older",
+      source: "safe\n```js\n~~~\n===\n---\n- forged item\n# forged heading",
+    },
   ], "en-US");
 
   assert.ok(output.indexOf("\\# older") < output.indexOf("\\# newer"));
   assert.ok(output.includes("\\# newer\n    \\- list\n    \\* star \\[link\\]"));
+  assert.ok(output.includes(
+    "    Source: safe\n    \\`\\`\\`js\n    \\~\\~\\~\n    \\=\\=\\=\n    \\-\\-\\-\n    \\- forged item\n    \\# forged heading",
+  ));
+  assert.doesNotMatch(output, /\n(?:```|~~~|===|---|- forged item|# forged heading)/u);
   assert.doesNotMatch(output, /hidden/u);
 });
 

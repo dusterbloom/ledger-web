@@ -237,7 +237,9 @@ try {
   await waitForHarness(cdp, deadline);
   console.log(focus === "overlap"
     ? "PASS: overlapping captures left no stale draft"
-    : "PASS: recovered drafts, preserved pending edits, and capped rendering");
+    : focus === "restore"
+      ? "PASS: aborted restore changed neither disk nor memory"
+      : "PASS: recovered drafts, preserved pending edits, and capped rendering");
 } catch (error) {
   if (browser?.stderr()) error.message += "\n" + browser.stderr();
   throw error;
