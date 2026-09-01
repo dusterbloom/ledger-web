@@ -73,3 +73,17 @@ test("legacy records generate unique IDs for missing and duplicate IDs", () => {
   assert.ok(used.has(missingId.id));
   assert.ok(used.has(duplicateId.id));
 });
+
+test("capture helpers are exposed from the testable application logic", () => {
+  const helpers = extractTestableLogic(readApp(), ["saveDraft", "appendFragment"]);
+  assert.equal(typeof helpers.saveDraft, "function");
+  assert.equal(typeof helpers.appendFragment, "function");
+});
+
+test("test helpers require both an explicit flag and a loopback hostname", () => {
+  const { isTestMode } = extractTestableLogic(readApp(), ["isTestMode"]);
+  assert.equal(isTestMode({ href: "http://127.0.0.1/index.html?test=1", hostname: "127.0.0.1" }), true);
+  assert.equal(isTestMode({ href: "http://localhost/index.html?test", hostname: "localhost" }), true);
+  assert.equal(isTestMode({ href: "http://127.0.0.1/index.html", hostname: "127.0.0.1" }), false);
+  assert.equal(isTestMode({ href: "https://ledger.example/index.html?test=1", hostname: "ledger.example" }), false);
+});

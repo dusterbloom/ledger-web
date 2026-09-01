@@ -218,7 +218,167 @@ async function loadState(db, now) {
   fragments.sort((a, b) => b.createdAt - a.createdAt);
   return { fragments, draft: typeof draftRecord?.value === "string" ? draftRecord.value : "" };
 }
+
+function isTestMode(currentLocation) {
+  const hostname = currentLocation.hostname;
+  return new URL(currentLocation.href).searchParams.has("test")
+    && (hostname === "127.0.0.1" || hostname === "localhost");
+}
+
+async function saveDraft(db, text) {
+  try {
+    const tx = db.transaction("meta", "readwrite");
+    tx.objectStore("meta").put({ key: "draft", value: text });
+    await transactionDone(tx);
+    draftFailureAnnounced = false;
+  } catch (error) {
+    if (!draftFailureAnnounced) {
+      draftFailureAnnounced = true;
+      announce("Draft not saved. Your text is still here.");
+    }
+    throw error;
+  }
+}
+
+async function appendFragment(db, text, source) {
+  const normalized = normalizeText(text);
+  if (!normalized) {
+    announce("Nothing to keep.");
+    return null;
+  }
+
+  if (draftTimer !== null) {
+    clearTimeout(draftTimer);
+    draftTimer = null;
+  }
+
+  const usedIds = new Set(state.fragments.map((fragment) => fragment.id));
+  const createdAt = Date.now();
+  const fragment = { id: nextGeneratedId(usedIds, createdAt), createdAt, text: normalized };
+  if (typeof source === "string" && source) fragment.source = source;
+
+  try {
+    const tx = db.transaction(["fragments", "meta"], "readwrite");
+    tx.objectStore("fragments").put(fragment);
+    tx.objectStore("meta").put({ key: "draft", value: "" });
+    await transactionDone(tx);
+  } catch {
+    announce("Fragment not saved. Your text is still here. Retry.");
+    return null;
+  }
+
+  state.fragments.unshift(fragment);
+  entry.value = "";
+  resizeEntry();
+  render();
+  announce("Fragment kept.");
+  return fragment;
+}
+
+function flushDraft() {
+  if (draftTimer !== null) {
+    clearTimeout(draftTimer);
+    draftTimer = null;
+  }
+  if (!database) return Promise.resolve();
+  return saveDraft(database, entry.value).catch(() => undefined);
+}
 /* @testable:end */
+
+const entry = document.querySelector("#entry");
+const stream = document.querySelector("#stream");
+const counts = document.querySelector("#counts");
+const status = document.querySelector("#status");
+let database;
+let draftTimer = null;
+let draftFailureAnnounced = false;
+let state = { fragments: [] };
+
+function announce(message) {
+  status.textContent = message;
+}
+
+function resizeEntry() {
+  entry.style.height = "auto";
+  entry.style.height = entry.scrollHeight + "px";
+}
+
+function render() {
+  stream.replaceChildren();
+  const visible = state.fragments.filter(isLive);
+  for (const fragment of visible) {
+    const article = document.createElement("article");
+    article.className = "frag";
+    const time = document.createElement("time");
+    time.dateTime = new Date(fragment.createdAt).toISOString();
+    time.textContent = new Date(fragment.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const body = document.createElement("div");
+    body.className = "body";
+    body.textContent = fragment.text;
+    article.append(time, body);
+    stream.append(article);
+  }
+  counts.textContent = visible.length + (visible.length === 1 ? " fragment" : " fragments");
+}
+
+async function start() {
+  database = await openDatabase();
+  await migrateLegacy(database);
+  const loaded = await loadState(database, Date.now());
+  state = { fragments: loaded.fragments };
+  entry.value = loaded.draft;
+  resizeEntry();
+  render();
+}
+
+async function readAll() {
+  const tx = database.transaction(["fragments", "meta"], "readonly");
+  const done = transactionDone(tx);
+  const [fragments, draftRecord] = await Promise.all([
+    requestResult(tx.objectStore("fragments").getAll()),
+    requestResult(tx.objectStore("meta").get("draft")),
+  ]);
+  await done;
+  return { fragments, draft: typeof draftRecord?.value === "string" ? draftRecord.value : "" };
+}
+
+entry.addEventListener("input", () => {
+  if (draftTimer !== null) clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => { void flushDraft(); }, 250);
+  resizeEntry();
+});
+
+entry.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    void appendFragment(database, entry.value);
+  }
+});
+
+document.querySelector("#save").addEventListener("click", () => {
+  void appendFragment(database, entry.value);
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") void flushDraft();
+});
+window.addEventListener("pagehide", () => { void flushDraft(); });
+
+const ready = start().catch((error) => {
+  announce("Ledger could not start.");
+  throw error;
+});
+
+if (isTestMode(location)) {
+  window.__ledgerTest = {
+    ready,
+    readAll,
+    closeDatabase() {
+      database?.close();
+      database = undefined;
+    },
+  };
+}
 </script>
 </body>
 </html>
