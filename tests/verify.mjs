@@ -38,3 +38,17 @@ test("capture, search, stream, status, and recovery controls are semantic", () =
   assert.match(html, /<label[^>]*for="entry"/);
   assert.match(html, /aria-live="polite"/);
 });
+
+test("fragment helpers preserve meaningful whitespace and classify tombstones", () => {
+  const { normalizeText, normalizeLegacyRecord, isLive } = extractTestableLogic(readApp(), [
+    "normalizeText", "normalizeLegacyRecord", "isLive",
+  ]);
+  assert.equal(normalizeText("  first\nsecond  \n"), "  first\nsecond");
+  assert.equal(normalizeText(" \n\t"), "");
+  const used = new Set();
+  assert.deepEqual(normalizeLegacyRecord({ id: "a", at: 42, text: "kept", src: "press" }, used, 99), {
+    id: "a", createdAt: 42, text: "kept", source: "press",
+  });
+  assert.equal(isLive({ id: "a", createdAt: 1, text: "x" }), true);
+  assert.equal(isLive({ id: "a", createdAt: 1, text: "x", deletedAt: 10, undoUntil: 200 }), false);
+});
