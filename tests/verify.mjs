@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,23 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const appPath = resolve(root, "index.html");
 const browserPath = resolve(root, "tests/browser-smoke.mjs");
 const readApp = () => readFileSync(appPath, "utf8");
+
+const legalFiles = [
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  "ThirdPartyLicenses/Literata-OFL.txt",
+  "ThirdPartyLicenses/WorkSans-OFL.txt",
+];
+
+function legalBlock(html) {
+  const match = html.match(/<template id="legalNotices">([\s\S]*?)<\/template>/);
+  assert.ok(match, "standalone legal-notices block missing");
+  return match[1];
+}
+
+function normalizeNotice(source) {
+  return source.replace(/[ \t]+$/gm, "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+}
 
 function inlineScript(html) {
   const matches = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
@@ -53,6 +70,25 @@ test("release closes document trust boundaries with a restrictive CSP", () => {
   assert.doesNotMatch(script, /\bconsole\s*\.|\b(?:localStorage|sessionStorage)\s*\.\s*setItem\([^)]*fragment/i);
 });
 
+test("repository and standalone app retain required legal notices and credit", () => {
+  const embedded = legalBlock(readApp());
+
+  for (const relative of legalFiles) {
+    const path = resolve(root, relative);
+    assert.ok(existsSync(path), relative + " missing");
+    const notice = normalizeNotice(readFileSync(path, "utf8"));
+    assert.ok(notice.length > 100, relative + " is unexpectedly short");
+    assert.ok(embedded.includes(notice), relative + " is not embedded verbatim in index.html");
+  }
+
+  const readmePath = resolve(root, "README.md");
+  assert.ok(existsSync(readmePath), "README.md missing");
+  const readme = readFileSync(readmePath, "utf8");
+  assert.match(readme, /github\.com\/veorq\/Plaintext/);
+  assert.match(readme, /Jean-Philippe Aumasson/);
+  assert.match(readme, /unofficial adaptation/i);
+});
+
 test("storage errors produce distinct actionable recovery copy", () => {
   const { describeStorageError } = extractTestableLogic(readApp(), ["describeStorageError"]);
   const quotaWithBackup = describeStorageError({ name: "QuotaExceededError" }, true);
@@ -77,6 +113,7 @@ test("responsive accessibility keeps controls visible and respects user settings
   for (const id of ["recovery", "retryStartup", "downloadLegacy"]) {
     assert.match(html, new RegExp('id="' + id + '"'), id + " missing");
   }
+  assert.match(html, /@media\s*\(prefers-color-scheme\s*:\s*dark\)[\s\S]*?--bg\s*:[^;}]+;[\s\S]*?--fg\s*:/i);
   assert.match(html, /@media\s*\(prefers-reduced-motion\s*:\s*reduce\)/i);
   assert.match(html, /@media\s*\(forced-colors\s*:\s*active\)/i);
   assert.match(html, /@media\s*\(pointer\s*:\s*coarse\)[\s\S]*?min-(?:width|height)\s*:\s*44px/i);
@@ -85,6 +122,13 @@ test("responsive accessibility keeps controls visible and respects user settings
     assert.match(html, new RegExp("env\\(safe-area-inset-" + side + "\\)"));
   }
   assert.doesNotMatch(html, /\.drop\s*\{[^}]*opacity\s*:\s*0(?:[;}])/i);
+});
+
+test("narrow viewport header wraps before its controls overflow", () => {
+  assert.match(
+    readApp(),
+    /@media\s*\(max-width\s*:\s*359px\)\s*\{[^}]*\.topbar\s*\{[^}]*flex-wrap\s*:\s*wrap/i,
+  );
 });
 
 test("capture, search, stream, status, and recovery controls are semantic", () => {
