@@ -483,13 +483,33 @@ function undoButton(id) {
 
 async function runDeletionChecks() {
   const initial = await frameWin().__ledgerTest.readAll();
+  const baseNow = Date.now();
+  const future = {
+    id: "future-dated", createdAt: baseNow + 86400000, text: "future-dated import",
+  };
+  await frameWin().__ledgerTest.seedFragments([...initial.fragments, future]);
+  frameWin().__ledgerTest.setNow(baseNow);
+  fragmentButton(future.id).click();
+  await until(async () => {
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === future.id);
+    return stored?.createdAt === future.createdAt
+      && stored?.deletedAt === baseNow
+      && stored?.undoUntil === baseNow + 30000;
+  }, "future-dated fragment was not deleted with a 30-second tombstone");
+  frameDoc().querySelector("#undo").click();
+  await until(async () => {
+    const stored = (await frameWin().__ledgerTest.readAll()).fragments.find((fragment) => fragment.id === future.id);
+    return stored?.createdAt === future.createdAt && !Number.isFinite(stored.deletedAt);
+  }, "Undo did not restore the future-dated fragment with its original timestamp");
+
+  const afterFutureUndo = await frameWin().__ledgerTest.readAll();
   const visibleIds = [...frameDoc().querySelectorAll("#stream .drop")]
     .map((button) => button.dataset.fragmentId);
   const [first, second] = visibleIds
-    .map((id) => initial.fragments.find((fragment) => fragment.id === id));
+    .filter((id) => id !== future.id)
+    .map((id) => afterFutureUndo.fragments.find((fragment) => fragment.id === id));
   assert(first && second, "deletion checks need two live fragments");
 
-  const baseNow = Date.now();
   frameWin().__ledgerTest.setNow(baseNow);
   fragmentButton(first.id).click();
   await until(async () => {

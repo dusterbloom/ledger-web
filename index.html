@@ -207,7 +207,6 @@ function validStoredRecord(value) {
   if (hasDeleted) {
     if (!hasValidTimestamp(value.deletedAt)
       || !hasValidTimestamp(value.undoUntil)
-      || value.deletedAt < value.createdAt
       || value.undoUntil <= value.deletedAt
       || value.undoUntil - value.deletedAt > UNDO_WINDOW_MS) return null;
     fragment.deletedAt = value.deletedAt;
@@ -814,7 +813,7 @@ async function deleteFragment(id, now) {
   }
   const fragment = state.fragments.find((candidate) => candidate.id === id);
   if (!fragment || !isLive(fragment) || !hasValidTimestamp(now)
-    || now < fragment.createdAt || now > MAX_DATE_MS - UNDO_WINDOW_MS) return null;
+    || now > MAX_DATE_MS - UNDO_WINDOW_MS) return null;
   const tombstone = { ...fragment, deletedAt: now, undoUntil: now + UNDO_WINDOW_MS };
   try {
     const tx = database.transaction("fragments", "readwrite");

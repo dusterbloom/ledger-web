@@ -178,13 +178,15 @@ test("all record timestamps stay inside the safe ECMAScript Date domain", () => 
 
   const live = { id: "live", createdAt: 1, text: "kept" };
   const tombstone = { id: "gone", createdAt: 1, text: "gone", deletedAt: 70, undoUntil: 100 };
+  const futureDatedTombstone = { id: "future", createdAt: 100, text: "future", deletedAt: 70, undoUntil: 100 };
   assert.deepEqual(validStoredRecord(live), live);
   assert.deepEqual(validStoredRecord(tombstone), tombstone);
+  assert.deepEqual(validStoredRecord(futureDatedTombstone), futureDatedTombstone);
   for (const invalid of [
     { ...live, createdAt: 1.5 },
     { ...live, createdAt: maxDate + 1 },
     { ...live, deletedAt: 2 },
-    { ...tombstone, deletedAt: 0 },
+    { ...tombstone, deletedAt: -1 },
     { ...tombstone, undoUntil: 69 },
     { ...tombstone, undoUntil: 30_071 },
   ]) assert.equal(validStoredRecord(invalid), null, JSON.stringify(invalid));
@@ -376,7 +378,7 @@ test("backup validation rejects unsupported documents and skips invalid records"
       { id: "expired", createdAt: 4, text: "gone", deletedAt: 5, undoUntil: 100 },
       { id: "fractional", createdAt: 1.5, text: "bad timestamp" },
       { id: "out-of-range", createdAt: 8_640_000_000_000_001, text: "bad timestamp" },
-      { id: "reversed", createdAt: 4, text: "bad tombstone", deletedAt: 3, undoUntil: 20 },
+      { id: "reversed", createdAt: 4, text: "bad tombstone", deletedAt: 5, undoUntil: 4 },
       { id: "long-window", createdAt: 4, text: "bad tombstone", deletedAt: 5, undoUntil: 30_006 },
       { id: "extra", createdAt: 6, text: "unknown", surprise: true },
     ],
