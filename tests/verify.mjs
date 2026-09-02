@@ -48,6 +48,14 @@ test("release is one offline HTML file with no cross-frame API", () => {
   assert.doesNotThrow(() => new Function(script));
 });
 
+test("favicon matches the standalone Ledger icon", () => {
+  const html = readApp();
+  const source = readFileSync(resolve(root, "icon.svg"), "utf8").trim();
+  const encoded = html.match(/<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml,([^"]+)">/)?.[1];
+  assert.ok(encoded, "SVG favicon missing");
+  assert.equal(decodeURIComponent(encoded), source);
+});
+
 test("release closes document trust boundaries with a restrictive CSP", () => {
   const html = readApp();
   const script = inlineScript(html);
