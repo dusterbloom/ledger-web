@@ -68,7 +68,7 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 <header class="topbar">
   <h1>Ledger</h1>
   <div class="actions">
-    <button id="connectWorkspace" type="button">Connect backup folder</button>
+    <button id="connectWorkspace" type="button" disabled>Connect backup folder</button>
     <button id="showLegacyData" type="button" hidden>Legacy data</button>
     <button id="import" type="button" disabled>Import</button>
     <button id="exportJson" type="button" disabled>Backup</button>
@@ -1040,6 +1040,8 @@ async function connectWorkspace() {
         const actualDigest = await digestText(canonicalFragments(parsed.fragments), crypto.subtle);
         if (actualDigest !== parsed.digest) throw new Error("Ledger backup integrity check failed");
         disk = parsed;
+        const preserved = await workspace.snapshots.getFileHandle("reconnected-" + parsed.savedAt + "-r" + parsed.revision + ".json", { create: true });
+        await writeVerifiedFile(preserved, raw);
       }
     } catch (error) {
       if (error?.name !== "NotFoundError") throw error;
@@ -1070,6 +1072,7 @@ function setRecoveryState(kind, details) {
   const wasWritable = persistenceWritable;
   persistenceWritable = Boolean(database) && (durableState.kind === "connected" || isTestMode(location))
     && (kind === "ready" || kind === "malformed");
+  connectWorkspaceButton.disabled = !database || kind === "loading";
   if (persistenceWritable && !wasWritable) draftFailureAnnounced = false;
   const canExport = hasVerifiedReadableSnapshot && (kind !== "quota" || state.fragments.length > 0);
   document.querySelector("#save").disabled = !persistenceWritable;

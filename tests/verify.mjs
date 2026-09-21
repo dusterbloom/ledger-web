@@ -386,6 +386,11 @@ test("durable backups are canonical, versioned, and comparable", async () => {
   assert.equal(api.reconcileRevisions(backup, { ...backup, revision: 4, parentDigest: digest, digest: "b".repeat(64) }), "cache");
 });
 
+test("workspace connection stays disabled until browser recovery is loaded", () => {
+  assert.match(readApp(), /id="connectWorkspace"[^>]*disabled/);
+  assert.match(readApp(), /connectWorkspaceButton\.disabled = !database/);
+});
+
 test("verified writes close before reading and reject mismatches", async () => {
   const { writeVerifiedFile } = extractTestableLogic(readApp(), ["writeVerifiedFile"]);
   let stored = "";
