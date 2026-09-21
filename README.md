@@ -3,6 +3,15 @@
 Ledger is a quiet, append-only fragment notebook delivered as one
 self-contained HTML file.
 
+## Durable workspace
+
+Ledger is read-only until **Connect backup folder** succeeds. Choose a folder
+you control; Ledger creates `Ledger/latest.json` and immutable files under
+`Ledger/snapshots/`. Every accepted change is serialized, closed, read back,
+and verified before **Saved to disk** appears. IndexedDB is a recovery cache,
+not the sole copy. A permission or verification failure locks editing until
+the folder is reconnected. Version 1 manual backups remain importable.
+
 Open the [live demo](https://dusterbloom.github.io/ledger-web/).
 
 ## Offline use

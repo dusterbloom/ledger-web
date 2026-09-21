@@ -68,6 +68,7 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 <header class="topbar">
   <h1>Ledger</h1>
   <div class="actions">
+    <button id="connectWorkspace" type="button">Connect backup folder</button>
     <button id="showLegacyData" type="button" hidden>Legacy data</button>
     <button id="import" type="button" disabled>Import</button>
     <button id="exportJson" type="button" disabled>Backup</button>
@@ -280,6 +281,64 @@ function makeBackup(fragments, now) {
   };
 }
 
+function canonicalFragments(fragments) {
+  return JSON.stringify((Array.isArray(fragments) ? fragments : [])
+    .map(validStoredRecord).filter(Boolean)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)));
+}
+
+async function digestText(text, subtle) {
+  const bytes = await subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function makeDurableBackup(fragments, now, revision, digest, parentDigest = null) {
+  if (!hasValidTimestamp(now) || !Number.isSafeInteger(revision) || revision < 1
+    || !/^[a-f0-9]{64}$/u.test(digest)) throw new TypeError("invalid durable revision");
+  return { format: "ledger-web", version: 2, savedAt: now, revision, parentDigest,
+    digest, fragments: JSON.parse(canonicalFragments(fragments)) };
+}
+
+function validateDurableBackup(value, now) {
+  const fields = ["format", "version", "savedAt", "revision", "parentDigest", "digest", "fragments"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !fields.includes(key))
+    || value.format !== "ledger-web" || value.version !== 2
+    || !hasValidTimestamp(value.savedAt) || !hasValidTimestamp(now)
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || (value.parentDigest !== null && !/^[a-f0-9]{64}$/u.test(value.parentDigest))
+    || !/^[a-f0-9]{64}$/u.test(value.digest) || !Array.isArray(value.fragments)) {
+    return { valid: false, error: "This is not a supported durable Ledger backup." };
+  }
+  const fragments = value.fragments.map(validStoredRecord);
+  if (fragments.some((row) => !row)) return { valid: false, error: "The durable Ledger backup contains invalid records." };
+  return { valid: true, fragments, revision: value.revision, digest: value.digest, parentDigest: value.parentDigest };
+}
+
+function reconcileRevisions(disk, cache) {
+  if (!disk) return cache ? "cache" : "same";
+  if (!cache) return "disk";
+  if (disk.digest === cache.digest) return "same";
+  if (cache.parentDigest === disk.digest && cache.revision > disk.revision) return "cache";
+  if (disk.parentDigest === cache.digest && disk.revision > cache.revision) return "disk";
+  return "conflict";
+}
+
+async function writeVerifiedFile(handle, text) {
+  const writable = await handle.createWritable();
+  await writable.write(text);
+  await writable.close();
+  const actual = await (await handle.getFile()).text();
+  if (actual !== text) throw new Error("disk write verification failed");
+}
+
+async function createLedgerWorkspace(directory) {
+  const root = await directory.getDirectoryHandle("Ledger", { create: true });
+  const snapshots = await root.getDirectoryHandle("snapshots", { create: true });
+  const latest = await root.getFileHandle("latest.json", { create: true });
+  return { root, snapshots, latest };
+}
+
 function validImportedRecord(value, now, usedIds) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   if (Object.keys(value).some((key) => !BACKUP_FIELDS.includes(key))) return null;
@@ -311,6 +370,12 @@ function validImportedRecord(value, now, usedIds) {
 }
 
 function validateBackup(value, now) {
+  if (value?.format === "ledger-web" && value?.version === 2) {
+    const durable = validateDurableBackup(value, now);
+    return durable.valid
+      ? { valid: true, fragments: durable.fragments, invalid: 0 }
+      : { valid: false, error: durable.error };
+  }
   const topLevelFields = ["format", "version", "exportedAt", "fragments"];
   if (!value || typeof value !== "object" || Array.isArray(value)
     || Object.keys(value).some((key) => !topLevelFields.includes(key))
@@ -795,6 +860,7 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
   if (!hasNewerText) entry.value = "";
   resizeEntry();
   render();
+  if (durableState.kind === "connected") await enqueueDurableState();
   announce("Fragment kept.");
   entry.focus();
   if (hasNewerText) {
@@ -827,6 +893,7 @@ async function deleteFragment(id, now) {
   }
   state.fragments = state.fragments.map((candidate) => candidate.id === id ? tombstone : candidate);
   render();
+  if (durableState.kind === "connected") await enqueueDurableState();
   announce("Fragment deleted.");
   undo.focus();
   return tombstone;
@@ -856,6 +923,7 @@ async function undoDelete(id, now) {
     .map((candidate) => candidate.id === id ? restored : candidate)
     .sort((a, b) => b.createdAt - a.createdAt);
   render();
+  if (durableState.kind === "connected") await enqueueDurableState();
   announce("Fragment restored.");
   const restoredControl = [...stream.querySelectorAll(".drop")]
     .find((button) => button.dataset.fragmentId === id);
@@ -902,6 +970,7 @@ const importButton = document.querySelector("#import");
 const exportJson = document.querySelector("#exportJson");
 const exportMarkdown = document.querySelector("#exportMarkdown");
 const fileInput = document.querySelector("#fileInput");
+const connectWorkspaceButton = document.querySelector("#connectWorkspace");
 let database;
 let draftTimer = null;
 let expiryTimer = null;
@@ -922,6 +991,76 @@ let inputRevision = 0;
 let captureQueue = Promise.resolve();
 let state = { fragments: [] };
 let renderLimit = 100;
+let durableState = { kind: "disconnected", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
+
+async function persistDurableState(rows = state.fragments) {
+  if (durableState.kind !== "connected") throw new Error("backup disconnected");
+  const parentDigest = durableState.digest;
+  const revision = durableState.revision + 1;
+  const canonical = canonicalFragments(rows);
+  const digest = await digestText(canonical, crypto.subtle);
+  const envelope = makeDurableBackup(rows, currentTime(), revision, digest, parentDigest);
+  const text = JSON.stringify(envelope, null, 2) + "\n";
+  announce("Saving to disk…");
+  const stamp = String(envelope.savedAt) + "-r" + revision + ".json";
+  const snapshot = await durableState.workspace.snapshots.getFileHandle(stamp, { create: true });
+  await writeVerifiedFile(snapshot, text);
+  await writeVerifiedFile(durableState.workspace.latest, text);
+  durableState.revision = revision;
+  durableState.digest = digest;
+  announce("Saved to disk");
+}
+
+function enqueueDurableState(rows = state.fragments) {
+  const snapshot = rows.map((row) => ({ ...row }));
+  durableState.queue = durableState.queue.then(() => persistDurableState(snapshot));
+  durableState.queue.catch(() => {
+    durableState.kind = "disconnected";
+    setRecoveryState("ready");
+    announce("Backup disconnected. Reconnect to edit.");
+  });
+  return durableState.queue;
+}
+
+async function connectWorkspace() {
+  if (!window.showDirectoryPicker) {
+    announce("This browser cannot keep a verified disk backup. Ledger is read-only.");
+    return false;
+  }
+  try {
+    announce("Connecting backup…");
+    const directory = await window.showDirectoryPicker({ mode: "readwrite" });
+    const workspace = await createLedgerWorkspace(directory);
+    let disk = null;
+    try {
+      const raw = await (await workspace.latest.getFile()).text();
+      if (raw.trim()) {
+        const parsed = JSON.parse(raw);
+        if (!validateDurableBackup(parsed, currentTime()).valid) throw new Error("invalid Ledger backup");
+        const actualDigest = await digestText(canonicalFragments(parsed.fragments), crypto.subtle);
+        if (actualDigest !== parsed.digest) throw new Error("Ledger backup integrity check failed");
+        disk = parsed;
+      }
+    } catch (error) {
+      if (error?.name !== "NotFoundError") throw error;
+    }
+    durableState = { kind: "connected", workspace, revision: disk?.revision || 0,
+      digest: disk?.digest || null, queue: Promise.resolve() };
+    if (disk && canonicalFragments(disk.fragments) !== canonicalFragments(state.fragments)) {
+      const useDisk = confirm("Disk and browser copies differ. OK restores the disk copy; Cancel preserves browser data into a new snapshot.");
+      if (useDisk) await restoreRows(disk.fragments, currentTime());
+    }
+    setRecoveryState("ready");
+    await enqueueDurableState();
+    connectWorkspaceButton.textContent = "Backup connected";
+    return true;
+  } catch (error) {
+    durableState.kind = "disconnected";
+    setRecoveryState("ready");
+    if (error?.name !== "AbortError") announce("Backup disconnected. Ledger remains read-only.");
+    return false;
+  }
+}
 
 function announce(message) {
   status.textContent = message;
@@ -929,7 +1068,8 @@ function announce(message) {
 
 function setRecoveryState(kind, details) {
   const wasWritable = persistenceWritable;
-  persistenceWritable = Boolean(database) && (kind === "ready" || kind === "malformed");
+  persistenceWritable = Boolean(database) && (durableState.kind === "connected" || isTestMode(location))
+    && (kind === "ready" || kind === "malformed");
   if (persistenceWritable && !wasWritable) draftFailureAnnounced = false;
   const canExport = hasVerifiedReadableSnapshot && (kind !== "quota" || state.fragments.length > 0);
   document.querySelector("#save").disabled = !persistenceWritable;
@@ -953,6 +1093,8 @@ function setRecoveryState(kind, details) {
   render();
 }
 
+connectWorkspaceButton.addEventListener("click", () => { void connectWorkspace(); });
+
 function resizeEntry() {
   entry.style.height = "auto";
   entry.style.height = entry.scrollHeight + "px";
@@ -966,6 +1108,7 @@ async function restoreRows(rows, now = currentTime(), invalid = 0) {
   state.fragments = state.fragments.concat(plan.add).sort(compareNewestFirst);
   renderLimit = 100;
   render();
+  if (durableState.kind === "connected") await enqueueDurableState();
   return summary;
 }
 

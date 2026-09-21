@@ -371,6 +371,35 @@ test("backup preserves stored fields and excludes only expired tombstones", () =
   });
 });
 
+test("durable backups are canonical, versioned, and comparable", async () => {
+  const api = extractTestableLogic(readApp(), ["canonicalFragments", "digestText", "makeDurableBackup", "validateDurableBackup", "reconcileRevisions"]);
+  const rows = [{ id: "b", createdAt: 2, text: "B" }, { id: "a", createdAt: 1, text: "A" }];
+  const canonical = api.canonicalFragments(rows);
+  assert.equal(canonical, JSON.stringify([rows[1], rows[0]]));
+  const digest = await api.digestText(canonical, crypto.subtle);
+  const backup = api.makeDurableBackup(rows, 100, 3, digest);
+  assert.equal(backup.version, 2);
+  assert.equal(backup.revision, 3);
+  assert.equal(api.validateDurableBackup(backup, 100).valid, true);
+  assert.equal(api.validateDurableBackup({ ...backup, digest: "bad" }, 100).valid, false);
+  assert.equal(api.reconcileRevisions(backup, { ...backup }), "same");
+  assert.equal(api.reconcileRevisions(backup, { ...backup, revision: 4, parentDigest: digest, digest: "b".repeat(64) }), "cache");
+});
+
+test("verified writes close before reading and reject mismatches", async () => {
+  const { writeVerifiedFile } = extractTestableLogic(readApp(), ["writeVerifiedFile"]);
+  let stored = "";
+  const events = [];
+  const handle = {
+    async createWritable() { return { async write(value) { events.push("write"); stored = value; }, async close() { events.push("close"); } }; },
+    async getFile() { events.push("read"); return { async text() { return stored; } }; },
+  };
+  await writeVerifiedFile(handle, "safe");
+  assert.deepEqual(events, ["write", "close", "read"]);
+  handle.getFile = async () => ({ async text() { return "corrupt"; } });
+  await assert.rejects(writeVerifiedFile(handle, "safe"), /verification/);
+});
+
 test("backup validation rejects unsupported documents and skips invalid records", () => {
   const { validateBackup } = extractTestableLogic(readApp(), ["validateBackup"]);
   assert.equal(validateBackup({ format: "other", version: 1, fragments: [] }, 100).valid, false);
