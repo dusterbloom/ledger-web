@@ -12,6 +12,18 @@ and verified before **Saved to disk** appears. IndexedDB is a recovery cache,
 not the sole copy. A permission or verification failure locks editing until
 the folder is reconnected. Version 1 manual backups remain importable.
 
+On each launch:
+
+1. Select **Connect backup folder**.
+2. Choose the parent folder that should contain Ledger's durable data.
+3. Resolve any disk/browser divergence when prompted.
+4. Do not close the page while the status says **Saving to disk…**.
+
+Ledger preserves the existing disk revision before reconciliation. It never
+automatically deletes snapshots. Copy the whole `Ledger` directory to restore
+or migrate the notebook; `latest.json` is the current complete state and
+`snapshots/` contains prior complete states.
+
 Open the [live demo](https://dusterbloom.github.io/ledger-web/).
 
 ## Offline use
@@ -46,21 +58,23 @@ accepts Markdown and plain-text files, splitting them into ordered fragments.
 **Markdown** downloads a chronological, human-readable archive of live
 fragments.
 
-Keep your own backup files. Browser storage belongs to the browser profile and
-can be removed when site data or the profile is cleared.
+The connected workspace is the durable copy. Manual JSON and Markdown exports
+remain useful for off-device or versioned backups. Browser storage belongs to
+the browser profile and may disappear when site data or the profile is cleared.
 
 ## Privacy
 
 Ledger has no account, analytics, cloud sync, or runtime network requests.
-Fragments and drafts stay in browser storage unless you explicitly import or
-download a file.
+Fragments are written only to the folder you select and to the browser's local
+recovery cache.
 
 ## Browser support
 
-Ledger targets current stable Chrome/Chromium, Firefox, and Safari, including
-iOS Safari and Chrome on Android. GitHub Pages is the canonical supported route;
-directly opening the downloaded HTML file is provided for offline use and is
-subject to each browser's local-file storage policy.
+Durable editing requires a desktop Chromium browser that implements the File
+System Access API, such as current Chrome or Edge. Browsers without directory
+access remain read-only so they cannot silently make browser storage the only
+copy. GitHub Pages is the canonical supported route; directly opening the HTML
+file is subject to the browser's local-file and directory-access policies.
 
 ## Development and tests
 
