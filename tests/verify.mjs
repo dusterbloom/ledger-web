@@ -371,38 +371,87 @@ test("backup preserves stored fields and excludes only expired tombstones", () =
   });
 });
 
-test("durable backups are canonical, versioned, and comparable", async () => {
-  const api = extractTestableLogic(readApp(), ["canonicalFragments", "digestText", "makeDurableBackup", "validateDurableBackup", "reconcileRevisions"]);
-  const rows = [{ id: "b", createdAt: 2, text: "B" }, { id: "a", createdAt: 1, text: "A" }];
-  const canonical = api.canonicalFragments(rows);
-  assert.equal(canonical, JSON.stringify([rows[1], rows[0]]));
-  const digest = await api.digestText(canonical, crypto.subtle);
-  const backup = api.makeDurableBackup(rows, 100, 3, digest);
-  assert.equal(backup.version, 2);
-  assert.equal(backup.revision, 3);
-  assert.equal(api.validateDurableBackup(backup, 100).valid, true);
-  assert.equal(api.validateDurableBackup({ ...backup, digest: "bad" }, 100).valid, false);
-  assert.equal(api.reconcileRevisions(backup, { ...backup }), "same");
-  assert.equal(api.reconcileRevisions(backup, { ...backup, revision: 4, parentDigest: digest, digest: "b".repeat(64) }), "cache");
+const logLines = (...events) => events.map((event) => JSON.stringify({ v: 1, ...event })).join("\n") + "\n";
+
+test("safety-copy log folds keeps once, applies deletes and restores in order, skips damaged lines", () => {
+  const { foldLog } = extractTestableLogic(readApp(), ["foldLog"]);
+  const a = { id: "a", createdAt: 1, text: "A" };
+  const b = { id: "b", createdAt: 2, text: "B", source: "book" };
+  const text = logLines(
+    { op: "keep", at: 1, fragment: a },
+    { op: "keep", at: 2, fragment: b },
+    { op: "delete", at: 3, id: "a" },
+    { op: "keep", at: 4, fragment: { ...a, text: "replayed" } },
+    { op: "delete", at: 5, id: "b" },
+    { op: "restore", at: 6, id: "b" },
+  ) + "not json\n{\"v\":1,\"op\":\"keep\",\"fragment\":{\"id\":\"x\"}}\n{\"v\":1,\"op\":\"ke";
+  const fold = foldLog(text);
+  assert.deepEqual([...fold.live.values()], [b]);
+  assert.deepEqual([...fold.deleted], ["a"]);
+  assert.equal(fold.invalid, 3);
+  assert.equal(foldLog("").live.size, 0);
+});
+
+test("sync is a union that leaves browser and safety copy agreeing without dropping a fragment", () => {
+  const { foldLog, planSync } = extractTestableLogic(readApp(), ["foldLog", "planSync"]);
+  let seed = 7;
+  const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  for (let round = 0; round < 500; round += 1) {
+    const ids = ["a", "b", "c", "d", "e"].filter(() => random() < 0.7);
+    const browser = [];
+    const events = [];
+    for (const [index, id] of ids.entries()) {
+      const fragment = { id, createdAt: index + 1, text: "T" + id };
+      const place = random();
+      if (place < 0.4) browser.push(random() < 0.3 ? { ...fragment, deletedAt: 50, undoUntil: 60 } : fragment);
+      if (place > 0.3) {
+        events.push({ op: "keep", at: 1, fragment });
+        if (random() < 0.3) events.push({ op: "delete", at: 2, id });
+      }
+    }
+    const before = foldLog(events.length ? logLines(...events) : "");
+    const plan = planSync(browser, before, 100);
+    const after = foldLog((events.length ? logLines(...events) : "") + (plan.toDisk.length ? logLines(...plan.toDisk) : ""));
+    const browserAfter = browser.concat(plan.toBrowser);
+    const browserLive = new Set(browserAfter.filter((row) => !("deletedAt" in row)).map((row) => row.id));
+    const browserDeleted = new Set(browser.filter((row) => "deletedAt" in row).map((row) => row.id));
+    assert.deepEqual([...after.live.keys()].sort(), [...browserLive].sort(), "browser and safety copy disagree");
+    for (const id of new Set([...before.live.keys(), ...browser.map((row) => row.id)])) {
+      if (!browserDeleted.has(id)) assert.ok(after.live.has(id), "fragment " + id + " was dropped");
+    }
+    assert.equal(planSync(browserAfter, after, 100).toDisk.length, 0, "sync is not idempotent");
+    assert.equal(planSync(browserAfter, after, 100).toBrowser.length, 0, "sync is not idempotent");
+  }
+});
+
+test("the safety copy is only ever appended to", async () => {
+  const { appendLines } = extractTestableLogic(readApp(), ["appendLines"]);
+  let stored = "{\"v\":1}";
+  const handle = {
+    async getFile() { return { size: stored.length, async text() { return stored; } }; },
+    async createWritable(options) {
+      assert.deepEqual(options, { keepExistingData: true });
+      let draft = stored;
+      return {
+        async write(chunk) {
+          assert.equal(chunk.type, "write");
+          assert.equal(chunk.position, draft.length, "write did not start at the end of the file");
+          draft += chunk.data;
+        },
+        async close() { stored = draft; },
+      };
+    },
+  };
+  await appendLines(handle, [{ v: 1, op: "delete", at: 1, id: "a" }]);
+  assert.equal(stored, "{\"v\":1}\n{\"v\":1,\"op\":\"delete\",\"at\":1,\"id\":\"a\"}\n");
+  const unchanged = stored;
+  await appendLines(handle, []);
+  assert.equal(stored, unchanged);
 });
 
 test("workspace connection stays disabled until browser recovery is loaded", () => {
   assert.match(readApp(), /id="connectWorkspace"[^>]*disabled/);
   assert.match(readApp(), /connectWorkspaceButton\.disabled = !database/);
-});
-
-test("verified writes close before reading and reject mismatches", async () => {
-  const { writeVerifiedFile } = extractTestableLogic(readApp(), ["writeVerifiedFile"]);
-  let stored = "";
-  const events = [];
-  const handle = {
-    async createWritable() { return { async write(value) { events.push("write"); stored = value; }, async close() { events.push("close"); } }; },
-    async getFile() { events.push("read"); return { async text() { return stored; } }; },
-  };
-  await writeVerifiedFile(handle, "safe");
-  assert.deepEqual(events, ["write", "close", "read"]);
-  handle.getFile = async () => ({ async text() { return "corrupt"; } });
-  await assert.rejects(writeVerifiedFile(handle, "safe"), /verification/);
 });
 
 test("backup validation rejects unsupported documents and skips invalid records", () => {

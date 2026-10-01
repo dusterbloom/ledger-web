@@ -3,26 +3,25 @@
 Ledger is a quiet, append-only fragment notebook delivered as one
 self-contained HTML file.
 
-## Durable workspace
+## Never lose a note
 
-Ledger is read-only until **Connect backup folder** succeeds. Choose a folder
-you control; Ledger creates `Ledger/latest.json` and immutable files under
-`Ledger/snapshots/`. Every accepted change is serialized, closed, read back,
-and verified before **Saved to disk** appears. IndexedDB is a recovery cache,
-not the sole copy. A permission or verification failure locks editing until
-the folder is reconnected. Version 1 manual backups remain importable.
+Ledger is always ready to type in. Every fragment is written to the browser with
+strict durability, and Ledger asks the browser to keep its storage persistent.
 
-On each launch:
+After your first fragment, Ledger asks once for a **safety-copy folder**. From
+then on it appends every change to `Ledger/ledger.jsonl` in that folder and keeps
+a readable `Ledger/ledger.md` next to it. The log is only ever appended to, so a
+bug or an empty browser can never erase what is already in it. Ledger remembers
+the folder; if the browser asks again, your next click or key press re-grants it.
 
-1. Select **Connect backup folder**.
-2. Choose the parent folder that should contain Ledger's durable data.
-3. Resolve any disk/browser divergence when prompted.
-4. Do not close the page while the status says **Saving to disk…**.
+If the browser's data is ever cleared, open Ledger and choose **Restore from
+safety copy…**: everything in the folder comes back. Older `latest.json` and
+`snapshots/` backups in that folder are merged in automatically. Put the folder
+somewhere that is itself backed up (Time Machine, an external drive) to survive
+a dead disk too.
 
-Ledger preserves the existing disk revision before reconciliation. It never
-automatically deletes snapshots. Copy the whole `Ledger` directory to restore
-or migrate the notebook; `latest.json` is the current complete state and
-`snapshots/` contains prior complete states.
+Browsers that cannot write to folders (Safari, Firefox) keep working; use
+**Backup** to download a copy.
 
 Open the [live demo](https://dusterbloom.github.io/ledger-web/).
 
@@ -58,7 +57,7 @@ accepts Markdown and plain-text files, splitting them into ordered fragments.
 **Markdown** downloads a chronological, human-readable archive of live
 fragments.
 
-The connected workspace is the durable copy. Manual JSON and Markdown exports
+The safety-copy folder is the durable copy. Manual JSON and Markdown exports
 remain useful for off-device or versioned backups. Browser storage belongs to
 the browser profile and may disappear when site data or the profile is cleared.
 
@@ -70,10 +69,9 @@ recovery cache.
 
 ## Browser support
 
-Durable editing requires a desktop Chromium browser that implements the File
-System Access API, such as current Chrome or Edge. Browsers without directory
-access remain read-only so they cannot silently make browser storage the only
-copy. GitHub Pages is the canonical supported route; directly opening the HTML
+The safety-copy folder needs a desktop Chromium browser with the File System
+Access API, such as current Chrome or Edge. Other browsers keep full editing
+with browser storage plus downloaded backups. GitHub Pages is the canonical supported route; directly opening the HTML
 file is subject to the browser's local-file and directory-access policies.
 
 ## Development and tests

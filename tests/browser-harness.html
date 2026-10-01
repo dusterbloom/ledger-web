@@ -569,28 +569,109 @@ async function runDeletionChecks() {
   await until(() => !fragmentButton(second.id), "second fragment stayed visible before expiry failure test");
   assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 30100, "expiry timer used the wrong deadline");
   frameDoc().querySelector("#recentlyDeleted").click();
-  assert(undoButton(first.id) && undoButton(second.id), "expiry failure setup did not expose both tombstones");
-  frameWin().__ledgerTest.failNextExpiryPurge();
+  assert(undoButton(first.id) && undoButton(second.id), "expiry setup did not expose both tombstones");
   frameWin().__ledgerTest.setNow(baseNow + 30100);
   await frameWin().__ledgerTest.fireExpiryTimer();
-  const failedPurge = await frameWin().__ledgerTest.readAll();
-  assert(failedPurge.fragments.some((fragment) => fragment.id === first.id), "forced purge failure did not preserve the tombstone");
-  assert(!undoButton(first.id) && undoButton(second.id), "purge failure did not remove expired Undo controls");
-  assert(!frameDoc().querySelector("#undoToast").hidden, "purge failure did not refresh the surviving Undo toast");
-  assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "purge failure left the expired tombstone in the toast");
-  assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 31000, "purge failure did not schedule the next future expiry");
+  assert(!undoButton(first.id) && undoButton(second.id), "expiry did not remove the expired Undo control");
+  assert(!frameDoc().querySelector("#undoToast").hidden, "expiry did not refresh the surviving Undo toast");
+  assert(frameDoc().querySelector("#undo").dataset.undoId === second.id, "expiry left the expired tombstone in the toast");
+  assert(frameWin().__ledgerTest.nextExpiryAt() === baseNow + 31000, "expiry did not schedule the next future expiry");
 
   frameWin().__ledgerTest.setNow(baseNow + 31000);
   await frameWin().__ledgerTest.fireExpiryTimer();
-  await until(async () => {
-    const stored = (await frameWin().__ledgerTest.readAll()).fragments;
-    return !stored.some((fragment) => fragment.id === first.id || fragment.id === second.id);
-  }, "future expiry did not retry cleanup in-session");
   assert(frameDoc().querySelector("#undoToast").hidden, "expired Undo toast remained visible");
   assert(frameDoc().querySelector("#recentlyDeleted").hidden, "expired recently deleted control remained visible");
   await reloadFrame();
-  const expired = (await frameWin().__ledgerTest.readAll()).fragments;
-  assert(!expired.some((fragment) => fragment.id === first.id || fragment.id === second.id), "expired tombstone survived reload cleanup");
+  const kept = (await frameWin().__ledgerTest.readAll()).fragments;
+  assert(kept.filter((fragment) => fragment.id === first.id || fragment.id === second.id)
+    .every((fragment) => "deletedAt" in fragment) && kept.some((fragment) => fragment.id === first.id),
+    "expired tombstones must stay in the browser until they reach the safety copy");
+  assert(!fragmentButton(first.id) && !fragmentButton(second.id), "expired tombstones became visible after reload");
+}
+
+async function readLog(directory) {
+  return (await (await directory.getFileHandle("ledger.jsonl")).getFile()).text();
+}
+
+function liveIdsInLog(text) {
+  const live = new Set();
+  for (const line of text.split("\n").filter(Boolean)) {
+    const event = JSON.parse(line);
+    if (event.op === "keep" || event.op === "restore") live.add(event.fragment?.id || event.id);
+    if (event.op === "delete") live.delete(event.id);
+  }
+  return live;
+}
+
+async function writeFile(directory, name, text) {
+  const writable = await (await directory.getFileHandle(name, { create: true })).createWritable();
+  await writable.write(text);
+  await writable.close();
+}
+
+async function runFocusedSafetyCopy() {
+  await deleteDatabase("ledger-web");
+  localStorage.clear();
+  const opfs = await navigator.storage.getDirectory();
+  await opfs.removeEntry("Ledger", { recursive: true }).catch(() => {});
+  const folder = await opfs.getDirectoryHandle("Ledger", { create: true });
+  const oldBackup = (fragments) => JSON.stringify({ format: "ledger-web", version: 1, exportedAt: 10, fragments });
+  await writeFile(folder, "latest.json", oldBackup([
+    { id: "old-a", createdAt: 1, text: "quote from latest" },
+    { id: "old-b", createdAt: 2, text: "bookmark from latest" },
+  ]));
+  const snapshots = await folder.getDirectoryHandle("snapshots", { create: true });
+  await writeFile(snapshots, "1-r1.json", oldBackup([
+    { id: "old-a", createdAt: 1, text: "quote from latest" },
+    { id: "old-c", createdAt: 3, text: "only in a snapshot" },
+  ]));
+
+  frame.src = "../index.html?test=1";
+  document.body.append(frame);
+  await ready();
+  const button = () => frameDoc().querySelector("#connectWorkspace");
+  assert(button().textContent === "Restore from safety copy…", "empty Ledger did not offer restore");
+  inputText(frameDoc().querySelector("#entry"), "fresh note");
+  frameDoc().querySelector("#save").click();
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 1, "fragment was not kept without a folder");
+  assert(button().textContent === "Choose safety-copy folder…" && button().classList.contains("attention"),
+    "Ledger did not ask for a safety-copy folder after the first fragment");
+
+  frameWin().showDirectoryPicker = async () => folder;
+  button().click();
+  await until(() => button().textContent === "Safety copy: Ledger", "safety copy did not turn on");
+  const firstLog = await readLog(folder);
+  const fresh = (await frameWin().__ledgerTest.readAll()).fragments.find((row) => row.text === "fresh note");
+  assert(JSON.stringify([...liveIdsInLog(firstLog)].sort()) === JSON.stringify(["old-a", "old-b", "old-c", fresh.id].sort()),
+    "safety copy did not union old backups with the browser");
+  assert((await frameWin().__ledgerTest.readAll()).fragments.length === 4, "old backups were not restored into the browser");
+  for await (const name of folder.keys()) assert(name !== "Ledger", "picking a Ledger folder nested another Ledger folder");
+  assert((await (await (await folder.getFileHandle("ledger.md")).getFile()).text()).includes("fresh note"),
+    "readable markdown copy missing");
+
+  fragmentButton(fresh.id).click();
+  await until(async () => (await readLog(folder)).includes('"op":"delete"'), "deletion did not reach the safety copy");
+  const secondLog = await readLog(folder);
+  assert(secondLog.startsWith(firstLog), "the safety copy was rewritten instead of appended to");
+
+  await reloadFrame();
+  await until(() => button().textContent === "Safety copy: Ledger", "remembered folder did not resume on reload");
+
+  frameWin().__ledgerTest.closeDatabase();
+  await deleteDatabase("ledger-web");
+  await reloadFrame();
+  assert(button().textContent === "Restore from safety copy…", "wiped browser did not offer restore");
+  frameWin().showDirectoryPicker = async () => folder;
+  button().click();
+  await until(async () => (await frameWin().__ledgerTest.readAll()).fragments.length === 3,
+    "wiped browser was not restored from the safety copy");
+  const restored = (await frameWin().__ledgerTest.readAll()).fragments.map((row) => row.text).sort();
+  assert(JSON.stringify(restored) === JSON.stringify(["bookmark from latest", "only in a snapshot", "quote from latest"]),
+    "restore brought back the wrong fragments");
+  assert(await readLog(folder) === secondLog, "restoring rewrote the safety copy");
+  frameWin().__ledgerTest.closeDatabase();
+  document.body.dataset.status = "pass";
+  result.textContent = "safety copy is append-only, remembered, and restores a wiped browser";
 }
 
 async function run() {
@@ -602,6 +683,10 @@ async function run() {
   }
   if (focus === "migration") {
     await runFocusedMigration();
+    return;
+  }
+  if (focus === "safety-copy") {
+    await runFocusedSafetyCopy();
     return;
   }
   if (focus === "exports") {

@@ -270,6 +270,7 @@ try {
     restore: "PASS: aborted restore changed neither disk nor memory",
     timestamps: "PASS: invalid timestamps were rejected or quarantined without breaking reload",
     migration: "PASS: migration was successful, abort-safe, and concurrent-start idempotent",
+    "safety-copy": "PASS: safety copy is append-only, remembered, and restores a wiped browser",
     exports: "PASS: exports read fresh cross-context storage with an explicit session fallback",
   };
   console.log(focusMessages[focus] || "PASS: recovered drafts, preserved pending edits, and capped rendering");

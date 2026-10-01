@@ -22,6 +22,7 @@ body{display:flex;flex-direction:column;margin:0;overflow:hidden;background:var(
 ::selection{background:var(--sel);color:var(--fg)}
 button,input,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
+button.attention{font-weight:600;text-decoration:underline}
 button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:max(17px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) 0 max(18px,env(safe-area-inset-left));max-width:736px;margin:0 auto}
 h1{margin:0;color:var(--sec);font-family:var(--editor);font-size:18px;font-weight:500;letter-spacing:-.01em}
@@ -68,7 +69,7 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 <header class="topbar">
   <h1>Ledger</h1>
   <div class="actions">
-    <button id="connectWorkspace" type="button" disabled>Connect backup folder</button>
+    <button id="connectWorkspace" type="button" disabled>Choose safety-copy folder…</button>
     <button id="showLegacyData" type="button" hidden>Legacy data</button>
     <button id="import" type="button" disabled>Import</button>
     <button id="exportJson" type="button" disabled>Backup</button>
@@ -109,6 +110,8 @@ dialog{color:var(--fg);background:var(--bg);border:1px solid var(--hair);border-
 /* @testable:start */
 const DB_NAME = "ledger-web";
 const DB_VERSION = 1;
+const STRICT_WRITE = { durability: "strict" };
+const SAFETY_COPY_KEY = "safetyCopy";
 const LEGACY_KEY = "ledger.fragments";
 const UNDO_WINDOW_MS = 30000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
@@ -281,22 +284,76 @@ function makeBackup(fragments, now) {
   };
 }
 
-function canonicalFragments(fragments) {
-  return JSON.stringify((Array.isArray(fragments) ? fragments : [])
-    .map(validStoredRecord).filter(Boolean)
-    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)));
+function liveCopy(fragment) {
+  const { deletedAt, undoUntil, ...live } = fragment;
+  return live;
 }
 
-async function digestText(text, subtle) {
-  const bytes = await subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
+// The safety copy is an append-only event log: replaying a line twice changes nothing,
+// and no code path can make it shorter.
+function foldLog(text) {
+  const live = new Map();
+  const deleted = new Map();
+  let invalid = 0;
+  for (const line of String(text).split("\n")) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      invalid += 1;
+      continue;
+    }
+    if (event?.v !== 1) {
+      invalid += 1;
+    } else if (event.op === "keep") {
+      const fragment = validStoredRecord(event.fragment);
+      if (!fragment || hasDeletedAt(fragment)) invalid += 1;
+      else if (!live.has(fragment.id) && !deleted.has(fragment.id)) live.set(fragment.id, fragment);
+    } else if (event.op === "delete" && typeof event.id === "string") {
+      if (live.has(event.id)) deleted.set(event.id, live.get(event.id));
+      else if (!deleted.has(event.id)) deleted.set(event.id, null);
+      live.delete(event.id);
+    } else if (event.op === "restore" && typeof event.id === "string") {
+      if (deleted.get(event.id)) live.set(event.id, deleted.get(event.id));
+      deleted.delete(event.id);
+    } else {
+      invalid += 1;
+    }
+  }
+  return { live, deleted: new Set(deleted.keys()), invalid };
 }
 
-function makeDurableBackup(fragments, now, revision, digest, parentDigest = null) {
-  if (!hasValidTimestamp(now) || !Number.isSafeInteger(revision) || revision < 1
-    || !/^[a-f0-9]{64}$/u.test(digest)) throw new TypeError("invalid durable revision");
-  return { format: "ledger-web", version: 2, savedAt: now, revision, parentDigest,
-    digest, fragments: JSON.parse(canonicalFragments(fragments)) };
+// Union of browser and safety copy. When they disagree about a deletion the fragment
+// stays live: a deletion may come back, a note never vanishes.
+function planSync(browserRows, fold, now) {
+  const plan = { toBrowser: [], toDisk: [] };
+  const browserIds = new Set();
+  for (const row of (Array.isArray(browserRows) ? browserRows : []).map(validStoredRecord).filter(Boolean)) {
+    browserIds.add(row.id);
+    const diskState = fold.live.has(row.id) ? "live" : fold.deleted.has(row.id) ? "deleted" : "absent";
+    if (!hasDeletedAt(row)) {
+      if (diskState === "deleted") plan.toDisk.push({ v: 1, op: "restore", at: now, id: row.id });
+      if (diskState === "absent") plan.toDisk.push({ v: 1, op: "keep", at: now, fragment: row });
+      continue;
+    }
+    if (diskState === "absent") plan.toDisk.push({ v: 1, op: "keep", at: now, fragment: liveCopy(row) });
+    if (diskState !== "deleted") plan.toDisk.push({ v: 1, op: "delete", at: row.deletedAt, id: row.id });
+  }
+  for (const [id, fragment] of fold.live) {
+    if (!browserIds.has(id)) plan.toBrowser.push(fragment);
+  }
+  return plan;
+}
+
+async function appendLines(fileHandle, events) {
+  if (!events.length) return;
+  const file = await fileHandle.getFile();
+  const separator = file.size && !(await file.text()).endsWith("\n") ? "\n" : "";
+  const writable = await fileHandle.createWritable({ keepExistingData: true });
+  await writable.write({ type: "write", position: file.size,
+    data: separator + events.map((event) => JSON.stringify(event)).join("\n") + "\n" });
+  await writable.close();
 }
 
 function validateDurableBackup(value, now) {
@@ -315,28 +372,9 @@ function validateDurableBackup(value, now) {
   return { valid: true, fragments, revision: value.revision, digest: value.digest, parentDigest: value.parentDigest };
 }
 
-function reconcileRevisions(disk, cache) {
-  if (!disk) return cache ? "cache" : "same";
-  if (!cache) return "disk";
-  if (disk.digest === cache.digest) return "same";
-  if (cache.parentDigest === disk.digest && cache.revision > disk.revision) return "cache";
-  if (disk.parentDigest === cache.digest && disk.revision > cache.revision) return "disk";
-  return "conflict";
-}
-
-async function writeVerifiedFile(handle, text) {
-  const writable = await handle.createWritable();
-  await writable.write(text);
-  await writable.close();
-  const actual = await (await handle.getFile()).text();
-  if (actual !== text) throw new Error("disk write verification failed");
-}
-
-async function createLedgerWorkspace(directory) {
-  const root = await directory.getDirectoryHandle("Ledger", { create: true });
-  const snapshots = await root.getDirectoryHandle("snapshots", { create: true });
-  const latest = await root.getFileHandle("latest.json", { create: true });
-  return { root, snapshots, latest };
+async function openSafetyCopy(directory) {
+  const root = directory.name === "Ledger" ? directory : await directory.getDirectoryHandle("Ledger", { create: true });
+  return { root, log: await root.getFileHandle("ledger.jsonl", { create: true }) };
 }
 
 function validImportedRecord(value, now, usedIds) {
@@ -434,7 +472,7 @@ function planRestore(existing, incoming, now) {
 
 async function restoreBackup(db, plan) {
   const additions = Array.isArray(plan?.add) ? plan.add : [];
-  const tx = db.transaction("fragments", "readwrite");
+  const tx = db.transaction("fragments", "readwrite", STRICT_WRITE);
   const store = tx.objectStore("fragments");
   for (const fragment of additions) store.add(fragment);
   await transactionDone(tx);
@@ -609,22 +647,8 @@ function transactionDone(tx) {
   });
 }
 
-async function purgeExpired(db, now) {
-  if (!hasValidTimestamp(now)) throw new TypeError("purge time is invalid");
-  const tx = db.transaction("fragments", "readwrite");
-  const store = tx.objectStore("fragments");
-  const fragments = await requestResult(store.getAll());
-  const expiredIds = fragments
-    .map(validStoredRecord)
-    .filter((fragment) => fragment && !isLive(fragment) && fragment.undoUntil <= now)
-    .map((fragment) => fragment.id);
-  for (const id of expiredIds) store.delete(id);
-  await transactionDone(tx);
-  return expiredIds;
-}
-
 async function migrateLegacy(db, legacyStorage) {
-  const writeTx = db.transaction(["fragments", "meta"], "readwrite");
+  const writeTx = db.transaction(["fragments", "meta"], "readwrite", STRICT_WRITE);
   const done = transactionDone(writeTx);
   const fragmentStore = writeTx.objectStore("fragments");
   const metaStore = writeTx.objectStore("meta");
@@ -684,7 +708,7 @@ async function migrateLegacy(db, legacyStorage) {
 
 async function loadState(db, now) {
   if (!hasValidTimestamp(now)) throw new TypeError("startup time is invalid");
-  const tx = db.transaction(["fragments", "meta"], "readwrite");
+  const tx = db.transaction(["fragments", "meta"], "readwrite", STRICT_WRITE);
   const done = transactionDone(tx);
   const fragmentStore = tx.objectStore("fragments");
   const metaStore = tx.objectStore("meta");
@@ -700,8 +724,6 @@ async function loadState(db, now) {
     const fragment = validStoredRecord(row);
     if (!fragment) {
       quarantined.push(row);
-      fragmentStore.delete(storedKeys[index]);
-    } else if (hasDeletedAt(fragment) && fragment.undoUntil <= now) {
       fragmentStore.delete(storedKeys[index]);
     } else {
       fragments.push(fragment);
@@ -789,7 +811,7 @@ async function saveDraft(db, text) {
     return false;
   }
   try {
-    const tx = db.transaction("meta", "readwrite");
+    const tx = db.transaction("meta", "readwrite", STRICT_WRITE);
     tx.objectStore("meta").put({ key: "draft", value: text });
     if (draftFailuresRemaining > 0) {
       draftFailuresRemaining -= 1;
@@ -841,7 +863,7 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
   if (typeof source === "string" && source) fragment.source = source;
 
   try {
-    const tx = db.transaction(["fragments", "meta"], "readwrite");
+    const tx = db.transaction(["fragments", "meta"], "readwrite", STRICT_WRITE);
     tx.objectStore("fragments").put(fragment);
     tx.objectStore("meta").put({ key: "draft", value: "" });
     if (shouldFailNextCaptureTransaction) {
@@ -860,8 +882,9 @@ async function appendFragmentNow(db, text, source, submittedRevision) {
   if (!hasNewerText) entry.value = "";
   resizeEntry();
   render();
-  if (durableState.kind === "connected") await enqueueDurableState();
-  announce("Fragment kept.");
+  void syncSafetyCopy();
+  announce(safetyCopy.kind === "on" ? "Fragment kept."
+    : "Fragment kept in this browser. Choose a safety-copy folder so it can never be lost.");
   entry.focus();
   if (hasNewerText) {
     if (draftTimer !== null) {
@@ -883,7 +906,7 @@ async function deleteFragment(id, now) {
     || now > MAX_DATE_MS - UNDO_WINDOW_MS) return null;
   const tombstone = { ...fragment, deletedAt: now, undoUntil: now + UNDO_WINDOW_MS };
   try {
-    const tx = database.transaction("fragments", "readwrite");
+    const tx = database.transaction("fragments", "readwrite", STRICT_WRITE);
     tx.objectStore("fragments").put(tombstone);
     await transactionDone(tx);
   } catch (error) {
@@ -893,7 +916,7 @@ async function deleteFragment(id, now) {
   }
   state.fragments = state.fragments.map((candidate) => candidate.id === id ? tombstone : candidate);
   render();
-  if (durableState.kind === "connected") await enqueueDurableState();
+  void syncSafetyCopy();
   announce("Fragment deleted.");
   undo.focus();
   return tombstone;
@@ -911,7 +934,7 @@ async function undoDelete(id, now) {
   }
   const { deletedAt, undoUntil, ...restored } = fragment;
   try {
-    const tx = database.transaction("fragments", "readwrite");
+    const tx = database.transaction("fragments", "readwrite", STRICT_WRITE);
     tx.objectStore("fragments").put(restored);
     await transactionDone(tx);
   } catch (error) {
@@ -923,7 +946,7 @@ async function undoDelete(id, now) {
     .map((candidate) => candidate.id === id ? restored : candidate)
     .sort((a, b) => b.createdAt - a.createdAt);
   render();
-  if (durableState.kind === "connected") await enqueueDurableState();
+  void syncSafetyCopy();
   announce("Fragment restored.");
   const restoredControl = [...stream.querySelectorAll(".drop")]
     .find((button) => button.dataset.fragmentId === id);
@@ -977,7 +1000,6 @@ let expiryTimer = null;
 let expiryCallback = null;
 let expiryDueAt = null;
 let expiryDelay = null;
-let shouldFailNextExpiryPurge = false;
 let shouldFailNextCaptureTransaction = false;
 let draftFailuresRemaining = 0;
 let draftFailureAnnounced = false;
@@ -991,77 +1013,132 @@ let inputRevision = 0;
 let captureQueue = Promise.resolve();
 let state = { fragments: [] };
 let renderLimit = 100;
-let durableState = { kind: "disconnected", workspace: null, revision: 0, digest: null, queue: Promise.resolve() };
+// Safety copy: an append-only log in a folder the user picked once.
+// kind: "none" (no folder yet) | "paused" (browser needs a click to re-grant) | "on".
+let safetyCopy = { kind: "none", directory: null, queue: Promise.resolve(), regrantTried: false };
 
-async function persistDurableState(rows = state.fragments) {
-  if (durableState.kind !== "connected") throw new Error("backup disconnected");
-  const parentDigest = durableState.digest;
-  const revision = durableState.revision + 1;
-  const canonical = canonicalFragments(rows);
-  const digest = await digestText(canonical, crypto.subtle);
-  const envelope = makeDurableBackup(rows, currentTime(), revision, digest, parentDigest);
-  const text = JSON.stringify(envelope, null, 2) + "\n";
-  announce("Saving to disk…");
-  const stamp = String(envelope.savedAt) + "-r" + revision + ".json";
-  const snapshot = await durableState.workspace.snapshots.getFileHandle(stamp, { create: true });
-  await writeVerifiedFile(snapshot, text);
-  await writeVerifiedFile(durableState.workspace.latest, text);
-  durableState.revision = revision;
-  durableState.digest = digest;
-  announce("Saved to disk");
+async function rememberedDirectory() {
+  const tx = database.transaction("meta", "readonly");
+  const record = await requestResult(tx.objectStore("meta").get(SAFETY_COPY_KEY));
+  return record?.value || null;
 }
 
-function enqueueDurableState(rows = state.fragments) {
-  const snapshot = rows.map((row) => ({ ...row }));
-  durableState.queue = durableState.queue.then(() => persistDurableState(snapshot));
-  durableState.queue.catch(() => {
-    durableState.kind = "disconnected";
-    setRecoveryState("ready");
-    announce("Backup disconnected. Reconnect to edit.");
-  });
-  return durableState.queue;
+async function rememberDirectory(directory) {
+  const tx = database.transaction("meta", "readwrite", STRICT_WRITE);
+  tx.objectStore("meta").put({ key: SAFETY_COPY_KEY, value: directory });
+  await transactionDone(tx);
 }
 
-async function connectWorkspace() {
-  if (!window.showDirectoryPicker) {
-    announce("This browser cannot keep a verified disk backup. Ledger is read-only.");
-    return false;
-  }
+async function importOldBackups(root) {
+  const files = [];
+  try { files.push(await root.getFileHandle("latest.json")); } catch {}
   try {
-    announce("Connecting backup…");
-    const directory = await window.showDirectoryPicker({ mode: "readwrite" });
-    const workspace = await createLedgerWorkspace(directory);
-    let disk = null;
+    for await (const handle of (await root.getDirectoryHandle("snapshots")).values()) {
+      if (handle.kind === "file" && handle.name.endsWith(".json")) files.push(handle);
+    }
+  } catch {}
+  const now = currentTime();
+  const fragments = [];
+  for (const handle of files) {
     try {
-      const raw = await (await workspace.latest.getFile()).text();
-      if (raw.trim()) {
-        const parsed = JSON.parse(raw);
-        if (!validateDurableBackup(parsed, currentTime()).valid) throw new Error("invalid Ledger backup");
-        const actualDigest = await digestText(canonicalFragments(parsed.fragments), crypto.subtle);
-        if (actualDigest !== parsed.digest) throw new Error("Ledger backup integrity check failed");
-        disk = parsed;
-        const preserved = await workspace.snapshots.getFileHandle("reconnected-" + parsed.savedAt + "-r" + parsed.revision + ".json", { create: true });
-        await writeVerifiedFile(preserved, raw);
-      }
-    } catch (error) {
-      if (error?.name !== "NotFoundError") throw error;
-    }
-    durableState = { kind: "connected", workspace, revision: disk?.revision || 0,
-      digest: disk?.digest || null, queue: Promise.resolve() };
-    if (disk && canonicalFragments(disk.fragments) !== canonicalFragments(state.fragments)) {
-      const useDisk = confirm("Disk and browser copies differ. OK restores the disk copy; Cancel preserves browser data into a new snapshot.");
-      if (useDisk) await restoreRows(disk.fragments, currentTime());
-    }
-    setRecoveryState("ready");
-    await enqueueDurableState();
-    connectWorkspaceButton.textContent = "Backup connected";
+      const backup = validateBackup(JSON.parse(await (await handle.getFile()).text()), now);
+      if (backup.valid) fragments.push(...backup.fragments.filter((fragment) => !hasDeletedAt(fragment)));
+    } catch {}
+  }
+  const current = (await readAll()).fragments;
+  await restoreBackup(database, planRestore(current, fragments, now));
+}
+
+async function writeMarkdownCopy(root, rows) {
+  const writable = await (await root.getFileHandle("ledger.md", { create: true })).createWritable();
+  await writable.write(markdownArchive(rows));
+  await writable.close();
+}
+
+async function syncNow() {
+  const copy = await openSafetyCopy(safetyCopy.directory);
+  const before = foldLog(await (await copy.log.getFile()).text());
+  if (!before.live.size && !before.deleted.size) await importOldBackups(copy.root);
+  const plan = planSync((await readAll()).fragments, before, currentTime());
+  if (plan.toBrowser.length) await restoreBackup(database, { add: plan.toBrowser });
+  await appendLines(copy.log, plan.toDisk);
+  const rows = (await readAll()).fragments.map(validStoredRecord).filter(Boolean);
+  if (plan.toDisk.length || plan.toBrowser.length) await writeMarkdownCopy(copy.root, rows);
+  state.fragments = rows.sort(compareNewestFirst);
+  render();
+}
+
+function syncSafetyCopy() {
+  if (safetyCopy.kind !== "on") return Promise.resolve();
+  const run = () => navigator.locks ? navigator.locks.request("ledger-safety-copy", syncNow) : syncNow();
+  const pending = safetyCopy.queue.then(run, run);
+  safetyCopy.queue = pending.catch(() => {
+    safetyCopy.kind = "paused";
+    renderSafetyCopy();
+    announce("Safety copy paused. Your notes are safe in this browser; click Resume safety copy.");
+  });
+  return pending;
+}
+
+async function startSafetyCopy(directory) {
+  safetyCopy.kind = "on";
+  safetyCopy.directory = directory;
+  renderSafetyCopy();
+  try {
+    await syncSafetyCopy();
+    announce("Safety copy on: everything is also saved in “" + directory.name + "”.");
     return true;
-  } catch (error) {
-    durableState.kind = "disconnected";
-    setRecoveryState("ready");
-    if (error?.name !== "AbortError") announce("Backup disconnected. Ledger remains read-only.");
+  } catch {
     return false;
   }
+}
+
+async function chooseSafetyCopy() {
+  if (safetyCopy.kind === "paused" && safetyCopy.directory) {
+    const directory = safetyCopy.directory;
+    if (await directory.requestPermission({ mode: "readwrite" }) === "granted") return startSafetyCopy(directory);
+  }
+  if (!window.showDirectoryPicker) {
+    announce("This browser can't keep a safety copy in a folder. Use Backup to download one.");
+    return false;
+  }
+  let directory;
+  try {
+    directory = await window.showDirectoryPicker({ id: "ledger", mode: "readwrite", startIn: "documents" });
+  } catch (error) {
+    if (error?.name !== "AbortError") announce("That folder can't be used. Choose another one.");
+    return false;
+  }
+  await rememberDirectory(directory);
+  return startSafetyCopy(directory);
+}
+
+async function resumeSafetyCopy() {
+  const directory = await rememberedDirectory().catch(() => null);
+  if (!directory) return renderSafetyCopy();
+  safetyCopy.directory = directory;
+  if (await directory.queryPermission({ mode: "readwrite" }) === "granted") return startSafetyCopy(directory);
+  safetyCopy.kind = "paused";
+  renderSafetyCopy();
+}
+
+// requestPermission needs a user gesture, so the first click or key press re-grants the folder.
+function regrantSafetyCopy() {
+  if (safetyCopy.kind !== "paused" || !safetyCopy.directory || safetyCopy.regrantTried) return;
+  safetyCopy.regrantTried = true;
+  const directory = safetyCopy.directory;
+  directory.requestPermission({ mode: "readwrite" })
+    .then((permission) => { if (permission === "granted") void startSafetyCopy(directory); }, () => {});
+}
+
+function renderSafetyCopy() {
+  const labels = {
+    none: state.fragments.some(isLive) ? "Choose safety-copy folder…" : "Restore from safety copy…",
+    paused: "Resume safety copy",
+    on: "Safety copy: " + safetyCopy.directory?.name,
+  };
+  connectWorkspaceButton.textContent = labels[safetyCopy.kind];
+  connectWorkspaceButton.classList.toggle("attention", safetyCopy.kind !== "on" && state.fragments.some(isLive));
 }
 
 function announce(message) {
@@ -1070,8 +1147,7 @@ function announce(message) {
 
 function setRecoveryState(kind, details) {
   const wasWritable = persistenceWritable;
-  persistenceWritable = Boolean(database) && (durableState.kind === "connected" || isTestMode(location))
-    && (kind === "ready" || kind === "malformed");
+  persistenceWritable = Boolean(database) && (kind === "ready" || kind === "malformed");
   connectWorkspaceButton.disabled = !database || kind === "loading";
   if (persistenceWritable && !wasWritable) draftFailureAnnounced = false;
   const canExport = hasVerifiedReadableSnapshot && (kind !== "quota" || state.fragments.length > 0);
@@ -1096,7 +1172,8 @@ function setRecoveryState(kind, details) {
   render();
 }
 
-connectWorkspaceButton.addEventListener("click", () => { void connectWorkspace(); });
+connectWorkspaceButton.addEventListener("click", () => { void chooseSafetyCopy(); });
+for (const type of ["pointerdown", "keydown"]) document.addEventListener(type, regrantSafetyCopy, true);
 
 function resizeEntry() {
   entry.style.height = "auto";
@@ -1111,7 +1188,7 @@ async function restoreRows(rows, now = currentTime(), invalid = 0) {
   state.fragments = state.fragments.concat(plan.add).sort(compareNewestFirst);
   renderLimit = 100;
   render();
-  if (durableState.kind === "connected") await enqueueDurableState();
+  void syncSafetyCopy();
   return summary;
 }
 
@@ -1186,24 +1263,10 @@ function renderDeletedDialog(tombstones) {
   deletedDialog.replaceChildren(title, list, close);
 }
 
-async function expireDeleted() {
-  if (!canMutate(database)) return;
-  try {
-    if (shouldFailNextExpiryPurge) {
-      shouldFailNextExpiryPurge = false;
-      throw new Error("test-expiry-purge-failure");
-    }
-    const expiredIds = await purgeExpired(database, currentTime());
-    if (expiredIds.length) {
-      const expired = new Set(expiredIds);
-      state.fragments = state.fragments.filter((fragment) => !expired.has(fragment.id));
-    }
-    render();
-  } catch (error) {
-    if (error?.name === "QuotaExceededError") setRecoveryState("quota", error);
-    render();
-    announce("Expired deletions could not be cleared.");
-  }
+// Tombstones are never purged: they are hidden after the Undo window and kept so the
+// deletion reaches the safety copy even if it was offline at the time.
+function expireDeleted() {
+  render();
 }
 
 function scheduleExpiry(tombstones, now) {
@@ -1310,6 +1373,7 @@ function render() {
   counts.textContent = resultCountLabel(visible.length, results.length, tokens.length > 0);
   loadMore.hidden = visible.length >= results.length;
   renderDeletionControls(unexpiredTombstones(state.fragments, now), now);
+  renderSafetyCopy();
 }
 
 async function start() {
@@ -1569,7 +1633,13 @@ exportMarkdown.addEventListener("click", async () => {
 document.addEventListener("visibilitychange", () => { void flushVisibilityDraft(); });
 window.addEventListener("pagehide", () => { void flushPageHideDraft(); });
 
-const ready = retryStartup();
+const ready = retryStartup().then(async (started) => {
+  if (started) {
+    navigator.storage?.persist?.().catch(() => {});
+    await resumeSafetyCopy().catch(() => renderSafetyCopy());
+  }
+  return started;
+});
 
 if (isTestMode(location)) {
   window.__ledgerTest = {
@@ -1589,9 +1659,6 @@ if (isTestMode(location)) {
       if (!expiryCallback) throw new Error("no expiry timer scheduled");
       if (expiryTimer !== null) clearTimeout(expiryTimer);
       return expiryCallback();
-    },
-    failNextExpiryPurge() {
-      shouldFailNextExpiryPurge = true;
     },
     failNextCaptureTransaction() {
       shouldFailNextCaptureTransaction = true;
@@ -1618,14 +1685,14 @@ if (isTestMode(location)) {
     },
     async seedStoredOnly(rows) {
       if (!Array.isArray(rows)) throw new TypeError("rows must be an array");
-      const tx = database.transaction("fragments", "readwrite");
+      const tx = database.transaction("fragments", "readwrite", STRICT_WRITE);
       const store = tx.objectStore("fragments");
       for (const row of rows) store.add(row);
       await transactionDone(tx);
     },
     async seedFragments(rows) {
       if (!Array.isArray(rows)) throw new TypeError("rows must be an array");
-      const tx = database.transaction("fragments", "readwrite");
+      const tx = database.transaction("fragments", "readwrite", STRICT_WRITE);
       const store = tx.objectStore("fragments");
       store.clear();
       for (const row of rows) store.put(row);
@@ -1635,7 +1702,7 @@ if (isTestMode(location)) {
       render();
     },
     async resetState() {
-      const tx = database.transaction(["fragments", "meta"], "readwrite");
+      const tx = database.transaction(["fragments", "meta"], "readwrite", STRICT_WRITE);
       tx.objectStore("fragments").clear();
       tx.objectStore("meta").put({ key: "draft", value: "" });
       await transactionDone(tx);
