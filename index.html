@@ -1015,7 +1015,7 @@ let state = { fragments: [] };
 let renderLimit = 100;
 // Safety copy: an append-only log in a folder the user picked once.
 // kind: "none" (no folder yet) | "paused" (browser needs a click to re-grant) | "on".
-let safetyCopy = { kind: "none", directory: null, queue: Promise.resolve(), regrantTried: false };
+let safetyCopy = { kind: "none", directory: null, queue: Promise.resolve(true), regrantTried: false };
 
 async function rememberedDirectory() {
   const tx = database.transaction("meta", "readonly");
@@ -1068,15 +1068,17 @@ async function syncNow() {
   render();
 }
 
+// Resolves true when the safety copy is up to date; never rejects.
 function syncSafetyCopy() {
-  if (safetyCopy.kind !== "on") return Promise.resolve();
+  if (safetyCopy.kind !== "on") return Promise.resolve(false);
   const run = () => navigator.locks ? navigator.locks.request("ledger-safety-copy", syncNow) : syncNow();
-  const pending = safetyCopy.queue.then(run, run);
-  safetyCopy.queue = pending.catch(() => {
+  const pending = safetyCopy.queue.then(run).then(() => true, () => {
     safetyCopy.kind = "paused";
     renderSafetyCopy();
     announce("Safety copy paused. Your notes are safe in this browser; click Resume safety copy.");
+    return false;
   });
+  safetyCopy.queue = pending;
   return pending;
 }
 
@@ -1084,13 +1086,9 @@ async function startSafetyCopy(directory) {
   safetyCopy.kind = "on";
   safetyCopy.directory = directory;
   renderSafetyCopy();
-  try {
-    await syncSafetyCopy();
-    announce("Safety copy on: everything is also saved in “" + directory.name + "”.");
-    return true;
-  } catch {
-    return false;
-  }
+  const synced = await syncSafetyCopy();
+  if (synced) announce("Safety copy on: everything is also saved in “" + directory.name + "”.");
+  return synced;
 }
 
 async function chooseSafetyCopy() {
